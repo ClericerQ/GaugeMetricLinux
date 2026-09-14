@@ -1,0 +1,74 @@
+{
+    "info": {
+        "version": "1.0",
+        "name": "GaugeMetricLinux"
+    },
+    "database": {
+       "DBIP": "sqlite",
+       "DB": "{dir}db/sqlite.db",
+       "DBPort": "3306",
+       "DBUser": "DBUsername",
+       "DBPass": "DBPassword"
+    },
+    "web": {
+        "host": "0.0.0.0",
+        "port": 8090,
+        "docroot": "{dir}public/",
+        "launch_ips": [
+            "127.0.0.1",
+            "192.168.76.8"
+        ],
+        "pid_file": "{dir}log/webserver.pid",
+        "lock_file": "{dir}log/webserver.lock",
+        "access_log": "{dir}log/webserver.log"
+    },
+    "kiosk": {
+        "mode": "auto",
+        "url": "http://127.0.0.1:{port}/",
+        "browsers": ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"],
+        "profile_dir": "{home}/.config/gaugemetric-kiosk",
+        "log_file": "{dir}log/kiosk.log",
+        "wait_seconds": 15,
+        "extra_flags": []
+    },
+    "route": {
+        "base_path": "",
+        "strip_ending": true,
+        "index_files": ["index.php", "index.html"],
+        "log_file": false,
+        "file": "routing.php",
+        "routes": {}
+    },
+    "log": {
+        "log_dir": "{dir}log/",
+        "write_log": true,
+        "print_log": true
+    },
+    "gauge": {
+        "sysinfo": ["{dir}sysinfo", "/usr/bin/sysinfo"],
+        "state_dir": "{dir}db/sysinfo/",
+        "snapshot": "{dir}db/metrics.json",
+        "call_timeout": 5,
+        "pid_file": "{dir}log/poller.pid",
+        "lock_file": "{dir}log/poller.lock",
+        "console_log": "{dir}log/poller.out",
+        "tiers": {
+            "cpu":     { "label": "CPU",               "interval_ms": 500,   "sections": ["cpu"],    "history": 120 },
+            "memory":  { "label": "Arbeitsspeicher",   "interval_ms": 1000,  "sections": ["mem"],    "history": 120 },
+            "network": { "label": "Netzwerk",          "interval_ms": 1000,  "sections": ["net"],    "history": 120 },
+            "sensors": { "label": "Sensoren",          "interval_ms": 2000,  "sections": ["temp", "gpu"], "history": 0 },
+            "diskio":  { "label": "Datenträger-I/O","interval_ms": 2000,  "sections": ["diskio"], "history": 90 },
+            "storage": { "label": "Laufwerke",         "interval_ms": 10000, "sections": ["disk"],   "history": 0 },
+            "system":  { "label": "System",            "interval_ms": 5000,  "sections": ["system"], "history": 0 }
+        },
+        "network": {
+            "exclude": ["lo", "veth*", "docker*", "br-*", "virbr*", "tap*", "fwbr*", "fwpr*", "fwln*"],
+            "hide_down": true
+        },
+        "storage": {
+            "warn_percent": 80,
+            "critical_percent": 90,
+            "exclude_mounts": ["/boot/efi"]
+        }
+    }
+}

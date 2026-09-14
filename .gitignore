@@ -1,0 +1,22 @@
+# Laufzeit-Daten – gehoeren zur Installation, nicht ins Repo.
+# Die Verzeichnisse selbst bleiben (siehe .gitkeep), damit ein frisches
+# Clone sofort lauffaehig ist; cLog und cDatabase legen sie sonst neu an.
+
+# Logs und Prozess-Dateien des Webservers
+/log/*
+!/log/.gitkeep
+
+# Datenbank
+/db/*
+!/db/.gitkeep
+
+# Temporaerdateien von cConfig::save() (tmp + rename)
+*.tmp
+
+# Lokale Werkzeug-Einstellungen (inkl. der .tmp.*-Reste beim Speichern)
+/.claude/settings.local.json*
+
+# Editor / OS
+.DS_Store
+*.swp
+*~

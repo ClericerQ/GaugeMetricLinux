@@ -1,0 +1,444 @@
+#!/bin/bash
+
+# Usage:
+#   sysinfo                          interactive terminal view
+#   sysinfo json                     all sections as JSON
+#   sysinfo json cpu mem net ...     only the given sections
+#
+# Sections: system cpu temp mem disk gpu diskio net
+#
+# SYSINFO_STATE_DIR=/some/dir keeps the counter state for the rate values
+# (cpu, diskio, net) in that directory. A background poller sets it so that
+# every value covers exactly the time since its previous call - and so that
+# an interactive sysinfo running at the same time does not skew its rates.
+
+STATE_DIR="${SYSINFO_STATE_DIR:-}"
+if [ -n "$STATE_DIR" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    DISK_STATE="$STATE_DIR/disk_stat_state"
+    NET_STATE="$STATE_DIR/net_stat_state"
+    CPU_STATE="$STATE_DIR/cpu_stat_state"
+else
+    DISK_STATE=/tmp/disk_stat_state
+    NET_STATE=/tmp/net_stat_state
+    CPU_STATE=""
+fi
+
+# --- Helpers ---
+
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
+human_rate() {
+    # bytes/s -> "12.34 KB/s" / "1.23 MB/s"
+    awk -v b="$1" 'BEGIN { k=b/1024; if (k > 1024) printf "%.2f MB/s", k/1024; else printf "%.2f KB/s", k }'
+}
+
+# --- Data Gathering Functions ---
+
+get_system_info() {
+    # Returns: hostname|kernel|uptime_s|load1|load5|load15|cpu_model|os
+    local host kernel up load model os
+    read -r host < /proc/sys/kernel/hostname
+    read -r kernel < /proc/sys/kernel/osrelease
+    read -r up _ < /proc/uptime
+    read -r l1 l5 l15 _ < /proc/loadavg
+    model=$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)
+    os=$( . /etc/os-release 2>/dev/null; echo "$PRETTY_NAME")
+    echo "$host|$kernel|$up|$l1|$l5|$l15|$model|$os"
+}
+
+get_cpu_mhz() {
+    grep "cpu MHz" /proc/cpuinfo | awk '{print $4}'
+}
+
+get_cpu_temp() {
+    # Returns: label|value  e.g. "Package id 0|53.0°C"
+    # Reads hwmon directly, so it also works without lm-sensors installed.
+    local h name t base label val key found=0
+    declare -A seen
+    for h in /sys/class/hwmon/hwmon*; do
+        [ -r "$h/name" ] || continue
+        read -r name < "$h/name"
+        for t in "$h"/temp*_input; do
+            [ -r "$t" ] || continue
+            base=${t%_input}
+            label=""
+            [ -r "${base}_label" ] && read -r label < "${base}_label"
+            read -r val < "$t" 2>/dev/null || continue
+            case "$name" in
+                coretemp|k10temp|zenpower|cpu_thermal) key=${label:-$name} ;;
+                *) key="$name${label:+ $label}" ;;
+            esac
+            # Several chips of the same kind (e.g. two NVMe drives) share a name.
+            if [ -n "${seen[$key]}" ]; then
+                seen[$key]=$(( ${seen[$key]} + 1 ))
+                key="$key #${seen[$key]}"
+            else
+                seen[$key]=1
+            fi
+            awk -v k="$key" -v v="$val" 'BEGIN { printf "%s|%.1f°C\n", k, v/1000 }'
+            found=1
+        done
+    done
+    if [ $found -eq 0 ]; then
+        sensors 2>/dev/null | awk -F: '/^(Package id|Core|Tctl|Tdie)/ { v=$2; sub(/^[ \t]*\+?/, "", v); sub(/[ \t(].*/, "", v); print $1 "|" v }'
+    fi
+}
+
+get_mem_info() {
+    # Force English locale (LC_ALL=C) so "Mem:" is always found regardless of system language
+    LC_ALL=C free -h | awk '/^Mem:/ {print $2, $3, $7}'
+}
+
+get_mem_bytes() {
+    # Returns: total used free buff/cache available swap_total swap_used (bytes)
+    LC_ALL=C free -b | awk '/^Mem:/ { m=$2" "$3" "$4" "$6" "$7 } /^Swap:/ { s=$2" "$3 } END { print m, s }'
+}
+
+get_disk_usage() {
+    # Returns: Total Used Free (for the root filesystem)
+    df -h / | awk 'NR==2 {print $2, $3, $4}'
+}
+
+get_filesystems() {
+    # Returns: device|fstype|size|used|avail|mount (bytes) for every real filesystem.
+    # timeout: a hanging network mount must not block the whole call.
+    LC_ALL=C timeout 3 df -B1 -P -T -x tmpfs -x devtmpfs -x squashfs -x overlay \
+        -x efivarfs -x ramfs -x fuse.lxcfs 2>/dev/null |
+        awk 'NR > 1 && $3 > 0 && !seen[$1]++ {
+                mnt=$7; for (i=8; i<=NF; i++) mnt=mnt" "$i;
+                printf "%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, mnt
+             }'
+}
+
+get_gpu_info() {
+    # Returns: Name|Temp|Power|Util
+    nvidia-smi --query-gpu=name,temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf "%s|%sC|%sW|%s%%\n", $1, $2, $3, $4}'
+}
+
+cpu_snapshot() {
+    awk '/^cpu/ { total=$2+$3+$4+$5+$6+$7+$8+$9; idle=$5; print $1, total, idle }' /proc/stat
+}
+
+get_cpu_stats() {
+    # Returns: name load  ("cpu" = all cores, "cpu0" ... per core)
+    # With a state dir the load covers the time since the previous call,
+    # otherwise a short 0.2 s sample is taken.
+    local prev curr
+    if [ -n "$CPU_STATE" ] && [ -f "$CPU_STATE" ]; then
+        prev=$(cat "$CPU_STATE")
+    else
+        prev=$(cpu_snapshot)
+        sleep 0.2
+    fi
+    curr=$(cpu_snapshot)
+    [ -n "$CPU_STATE" ] && echo "$curr" > "$CPU_STATE"
+    awk 'NR == FNR { pt[$1]=$2; pi[$1]=$3; next }
+         {
+            dt=$2-pt[$1]; di=$3-pi[$1];
+            if (dt > 0) printf "%s %.1f\n", $1, (dt-di)*100/dt; else printf "%s 0.0\n", $1;
+         }' <(echo "$prev") <(echo "$curr")
+}
+
+get_cpu_load() {
+    get_cpu_stats | awk '$1 ~ /^cpu[0-9]/ { print $2 }'
+}
+
+get_disk_io() {
+    # Returns: device|read_str|write_str|read_bps|write_bps|active_percent
+    now=$(date +%s.%N)
+    curr_stats=$(awk -v t="$now" '$3 ~ /^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+|mmcblk[0-9]+)$/ { print $3, $6, $10, t, $13 }' /proc/diskstats)
+
+    if [ ! -f "$DISK_STATE" ]; then
+        echo "$curr_stats" > "$DISK_STATE"
+        return 1
+    fi
+
+    echo "$curr_stats" | awk -v prev_file="$DISK_STATE" '
+    BEGIN {
+        while ((getline < prev_file) > 0) {
+            pr[$1]=$2; pw[$1]=$3; pt[$1]=$4;
+            # State files of older sysinfo versions have no I/O time column
+            if (NF >= 5) pio[$1]=$5;
+        }
+    }
+    {
+        dev=$1; cr=$2; cw=$3; ct=$4; cio=$5;
+        if (!(dev in pt)) next;
+        dt = ct - pt[dev];
+        if (dt > 0) {
+            rspeed = (cr - pr[dev]) * 0.5 / dt;
+            wspeed = (cw - pw[dev]) * 0.5 / dt;
+            if (rspeed < 0) rspeed = 0;
+            if (wspeed < 0) wspeed = 0;
+            # Field 13 = milliseconds spent doing I/O ("active time" like Windows)
+            util = (dev in pio) ? (cio - pio[dev]) / (dt * 10) : 0;
+            if (util < 0) util = 0;
+            if (util > 100) util = 100;
+            rstr = (rspeed > 1024) ? sprintf("%.2f MB/s", rspeed/1024) : sprintf("%.2f KB/s", rspeed);
+            wstr = (wspeed > 1024) ? sprintf("%.2f MB/s", wspeed/1024) : sprintf("%.2f KB/s", wspeed);
+            printf "%s|%s|%s|%.0f|%.0f|%.1f\n", dev, rstr, wstr, rspeed*1024, wspeed*1024, util;
+        }
+    }'
+    echo "$curr_stats" > "$DISK_STATE"
+    return 0
+}
+
+get_net_io() {
+    # Returns: iface|rx_str|tx_str|rx_bps|tx_bps|rx_total|tx_total|state|speed_mbit|ipv4
+    local now curr_stats line iface state speed ipv4
+    now=$(date +%s.%N)
+    curr_stats=$(awk -v t="$now" 'NR > 2 {
+            split($0, a, ":"); iface=a[1]; gsub(/ /, "", iface);
+            split(a[2], f, " ");
+            if (iface != "lo") print iface, f[1], f[9], t
+        }' /proc/net/dev)
+
+    if [ ! -f "$NET_STATE" ]; then
+        echo "$curr_stats" > "$NET_STATE"
+        return 1
+    fi
+
+    declare -A addr
+    while read -r _ iface _ cidr _; do
+        addr[$iface]="${addr[$iface]:+${addr[$iface]} }$cidr"
+    done < <(ip -o -4 addr show 2>/dev/null)
+
+    while IFS='|' read -r iface rest; do
+        [ -n "$iface" ] || continue
+        state=unknown; speed=-1
+        [ -r "/sys/class/net/$iface/operstate" ] && read -r state < "/sys/class/net/$iface/operstate"
+        # Virtual interfaces answer speed with EINVAL
+        [ -r "/sys/class/net/$iface/speed" ] && read -r speed < "/sys/class/net/$iface/speed" 2>/dev/null
+        [[ "$speed" =~ ^-?[0-9]+$ ]] || speed=-1
+        echo "$iface|$rest|$state|$speed|${addr[$iface]}"
+    done < <(echo "$curr_stats" | awk -v prev_file="$NET_STATE" '
+    BEGIN {
+        while ((getline < prev_file) > 0) {
+            prx[$1]=$2; ptx[$1]=$3; pt[$1]=$4;
+        }
+    }
+    {
+        dev=$1; rx=$2; tx=$3; ct=$4;
+        if (!(dev in pt)) next;
+        dt = ct - pt[dev];
+        if (dt > 0) {
+            rb = (rx - prx[dev]) / dt;
+            tb = (tx - ptx[dev]) / dt;
+            # Counter reset (interface re-created) - no negative rates
+            if (rb < 0) rb = 0;
+            if (tb < 0) tb = 0;
+            rstr = sprintf("%.2f Mbit/s", rb * 8 / 1000000);
+            tstr = sprintf("%.2f Mbit/s", tb * 8 / 1000000);
+            printf "%s|%s|%s|%.0f|%.0f|%s|%s\n", dev, rstr, tstr, rb, tb, rx, tx;
+        }
+    }')
+    echo "$curr_stats" > "$NET_STATE"
+    return 0
+}
+
+# --- JSON sections ---
+
+json_system() {
+    IFS='|' read -r host kernel up l1 l5 l15 model os <<< "$(get_system_info)"
+    printf '  "system": {"hostname": "%s", "kernel": "%s", "os": "%s", "cpu_model": "%s", "uptime_s": %s, "loadavg": [%s, %s, %s]}' \
+        "$(json_escape "$host")" "$(json_escape "$kernel")" "$(json_escape "$os")" "$(json_escape "$model")" \
+        "${up:-0}" "${l1:-0}" "${l5:-0}" "${l15:-0}"
+}
+
+json_cpu() {
+    local mhz stats total loads=() i
+    mapfile -t mhz < <(get_cpu_mhz)
+    while read -r name val; do
+        if [ "$name" == "cpu" ]; then total=$val; else loads+=("$val"); fi
+    done < <(get_cpu_stats)
+
+    echo -n "  \"cpu_mhz\": ["
+    for ((i=0; i<${#mhz[@]}; i++)); do
+        printf '"%s"%s' "${mhz[$i]}" "$([ $i -lt $((${#mhz[@]}-1)) ] && echo ',')"
+    done
+    echo "],"
+    echo -n "  \"cpu_load\": ["
+    for ((i=0; i<${#loads[@]}; i++)); do
+        printf '"%s"%s' "${loads[$i]}" "$([ $i -lt $((${#loads[@]}-1)) ] && echo ',')"
+    done
+    echo "],"
+    printf '  "cpu_total": "%s"' "${total:-0.0}"
+}
+
+json_temp() {
+    local temp_raw count i label val
+    mapfile -t temp_raw < <(get_cpu_temp)
+    echo "  \"temperatures\": {"
+    count=${#temp_raw[@]}
+    for ((i=0; i<$count; i++)); do
+        IFS='|' read -r label val <<< "${temp_raw[$i]}"
+        printf "    \"%s\": \"%s\"%s\n" "$(json_escape "$label")" "$val" "$([ $i -lt $((count-1)) ] && echo ',')"
+    done
+    echo -n "  }"
+}
+
+json_mem() {
+    local mem bytes
+    mem=($(get_mem_info))
+    bytes=($(get_mem_bytes))
+    printf '  "memory": {"total": "%s", "used": "%s", "available": "%s", "total_bytes": %s, "used_bytes": %s, "free_bytes": %s, "cache_bytes": %s, "available_bytes": %s, "swap_total_bytes": %s, "swap_used_bytes": %s}' \
+        "${mem[0]}" "${mem[1]}" "${mem[2]}" \
+        "${bytes[0]:-0}" "${bytes[1]:-0}" "${bytes[2]:-0}" "${bytes[3]:-0}" "${bytes[4]:-0}" "${bytes[5]:-0}" "${bytes[6]:-0}"
+}
+
+json_disk() {
+    local disk_cap fs_raw count i dev type size used avail mnt
+    disk_cap=($(get_disk_usage))
+    mapfile -t fs_raw < <(get_filesystems)
+    echo "  \"disk_usage\": {\"total\": \"${disk_cap[0]}\", \"used\": \"${disk_cap[1]}\", \"free\": \"${disk_cap[2]}\"},"
+    echo "  \"filesystems\": ["
+    count=${#fs_raw[@]}
+    for ((i=0; i<$count; i++)); do
+        IFS='|' read -r dev type size used avail mnt <<< "${fs_raw[$i]}"
+        printf '    {"device": "%s", "fstype": "%s", "mount": "%s", "total_bytes": %s, "used_bytes": %s, "free_bytes": %s}%s\n' \
+            "$(json_escape "$dev")" "$(json_escape "$type")" "$(json_escape "$mnt")" "$size" "$used" "$avail" \
+            "$([ $i -lt $((count-1)) ] && echo ',')"
+    done
+    echo -n "  ]"
+}
+
+json_gpu() {
+    local gpu_raw count i gname gtemp gpwr gutil
+    mapfile -t gpu_raw < <(get_gpu_info)
+    echo "  \"gpus\": ["
+    count=${#gpu_raw[@]}
+    for ((i=0; i<$count; i++)); do
+        IFS='|' read -r gname gtemp gpwr gutil <<< "${gpu_raw[$i]}"
+        printf "    {\"id\": %d, \"name\": \"%s\", \"temp\": \"%s\", \"power\": \"%s\", \"utilization\": \"%s\"}%s\n" \
+            "$i" "$(json_escape "$gname")" "$gtemp" "$gpwr" "$gutil" "$([ $i -lt $((count-1)) ] && echo ',')"
+    done
+    echo -n "  ]"
+}
+
+json_diskio() {
+    local disk_raw count i dev rd wr rbps wbps util
+    mapfile -t disk_raw < <(get_disk_io)
+    echo "  \"disk_io\": ["
+    count=${#disk_raw[@]}
+    for ((i=0; i<$count; i++)); do
+        IFS='|' read -r dev rd wr rbps wbps util <<< "${disk_raw[$i]}"
+        echo "    {\"device\": \"$dev\", \"read\": \"$rd\", \"write\": \"$wr\", \"read_bps\": $rbps, \"write_bps\": $wbps, \"active_percent\": $util}$([ $i -lt $((count-1)) ] && echo ',')"
+    done
+    echo -n "  ]"
+}
+
+json_net() {
+    local net_raw count i iface rx tx rxb txb rxt txt state speed ipv4
+    mapfile -t net_raw < <(get_net_io)
+    echo "  \"net_io\": ["
+    count=${#net_raw[@]}
+    for ((i=0; i<$count; i++)); do
+        IFS='|' read -r iface rx tx rxb txb rxt txt state speed ipv4 <<< "${net_raw[$i]}"
+        printf '    {"interface": "%s", "rx": "%s", "tx": "%s", "rx_bps": %s, "tx_bps": %s, "rx_total_bytes": %s, "tx_total_bytes": %s, "state": "%s", "speed_mbit": %s, "ipv4": "%s"}%s\n' \
+            "$(json_escape "$iface")" "$rx" "$tx" "$rxb" "$txb" "$rxt" "$txt" "$state" "$speed" "$ipv4" \
+            "$([ $i -lt $((count-1)) ] && echo ',')"
+    done
+    echo -n "  ]"
+}
+
+# --- Output Logic ---
+
+if [ "$1" == "json" ]; then
+    shift
+    sections=("$@")
+    [ ${#sections[@]} -eq 0 ] && sections=(system cpu temp mem disk gpu diskio net)
+
+    # Rate values need a previous reading - take one and wait briefly on first use.
+    primed=0
+    for s in "${sections[@]}"; do
+        if [ "$s" == "diskio" ] && [ ! -f "$DISK_STATE" ]; then get_disk_io > /dev/null; primed=1; fi
+        if [ "$s" == "net" ] && [ ! -f "$NET_STATE" ]; then get_net_io > /dev/null; primed=1; fi
+    done
+    [ $primed -eq 1 ] && sleep 0.5
+
+    parts=()
+    for s in "${sections[@]}"; do
+        case "$s" in
+            system) parts+=("$(json_system)") ;;
+            cpu)    parts+=("$(json_cpu)") ;;
+            temp)   parts+=("$(json_temp)") ;;
+            mem)    parts+=("$(json_mem)") ;;
+            disk)   parts+=("$(json_disk)") ;;
+            gpu)    parts+=("$(json_gpu)") ;;
+            diskio) parts+=("$(json_diskio)") ;;
+            net)    parts+=("$(json_net)") ;;
+            *)      echo "sysinfo: unknown section '$s'" >&2; exit 2 ;;
+        esac
+    done
+
+    echo "{"
+    printf '  "timestamp": %s' "$(date +%s.%N)"
+    for p in "${parts[@]}"; do
+        printf ',\n%s' "$p"
+    done
+    printf '\n}\n'
+
+else
+    # Hide cursor for a cleaner UI, restore it on exit.
+    # Only here: in JSON mode the escape codes would end up in front of the "{".
+    trap 'tput cnorm; rm -f "$DISK_STATE" "$NET_STATE"; exit' INT TERM
+    tput civis
+
+    clear
+    while true; do
+        tput cup 0 0
+        echo -e "\e[1;34m--- DGX Spark System Information ---\e[0m"
+
+        # GPU Info
+        echo -e "\n\e[1mGPU Status:\e[0m"
+        gpu_data=$(get_gpu_info)
+        if [ -z "$gpu_data" ]; then
+            echo "  No NVIDIA GPUs detected"
+        else
+            echo "$gpu_data" | awk -F'|' '{printf "  GPU %d: %-15s | Temp: %-4s | Pwr: %-5s | Util: %-4s\n", NR-1, $1, $2, $3, $4}'
+        fi
+
+        echo -e "\n\e[1mMemory Usage:\e[0m"
+        mem=($(get_mem_info))
+        printf "  %-10s %s\n" "Total:" "${mem[0]}"
+        printf "  %-10s %s\n" "Used:" "${mem[1]}"
+        printf "  %-10s %s\n" "Available:" "${mem[2]}"
+
+        echo -e "\n\e[1mCPU Load & Speed:\e[0m"
+        # Combine load and mhz for a compact view
+        load_arr=($(get_cpu_load))
+        mhz_arr=($(get_cpu_mhz))
+        for i in "${!load_arr[@]}"; do
+            printf "  Core %-2d: %5s%% @ %s MHz\n" "$i" "${load_arr[$i]}" "${mhz_arr[$i]}"
+        done | head -n 16 # Limit to 16 cores to prevent screen overflow, remove head to see all
+
+        echo -e "\n\e[1mDisk Capacity & I/O:\e[0m"
+        get_filesystems | awk -F'|' '{
+            printf "  %-20s %8.1f GB (Used: %.1f GB, Free: %.1f GB)\033[K\n", $6 ":", $3/1073741824, $4/1073741824, $5/1073741824
+        }'
+
+        disk_results=$(get_disk_io)
+        if [ $? -ne 0 ]; then
+            echo "  Detecting drives..."
+        else
+            echo "$disk_results" | awk -F'|' '{printf "  %-8s Read: %-12s Write: %-12s Active: %5s%%\033[K\n", $1 ":", $2, $3, $6}'
+        fi
+
+        echo -e "\n\e[1mNetwork:\e[0m"
+        net_results=$(get_net_io)
+        if [ $? -ne 0 ]; then
+            echo "  Detecting interfaces..."
+        else
+            echo "$net_results" | awk -F'|' '{printf "  %-10s Down: %-16s Up: %-16s %s\033[K\n", $1 ":", $2, $3, $10}'
+        fi
+
+        echo -e "\n\e[1;34m------------------------------------\e[0m"
+        sleep 1
+    done
+fi

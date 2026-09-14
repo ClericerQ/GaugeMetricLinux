@@ -1,0 +1,378 @@
+<?php
+
+/**
+ * cGaugePoller - Hintergrund-Poller fuer das Dashboard.
+ *
+ * Ruft sysinfo in festen Takten auf (gauge.tiers in config.json) und schreibt
+ * das Ergebnis als Snapshot nach db/. Die Weboberflaeche liest nur diese
+ * Datei: ein Seitenaufruf loest nie selbst eine Messung aus, und beliebig
+ * viele Kiosk-Bildschirme sehen dieselben Werte mit derselben Abtastrate.
+ *
+ * Gestartet wird ueber poller.sh (start|stop|restart|status|foreground).
+ */
+class cGaugePoller {
+
+    public ?string $lastError = null;
+
+    // sysinfo-Abschnitt -> Schluessel im Ergebnis von cSysinfo::normalize().
+    private const SECTION_KEYS = [
+        'system' => 'system',
+        'cpu'    => 'cpu',
+        'temp'   => 'temperatures',
+        'mem'    => 'memory',
+        'disk'   => 'filesystems',
+        'gpu'    => 'gpus',
+        'diskio' => 'disk_io',
+        'net'    => 'network',
+    ];
+
+    // Abschnitte, deren Werte Raten aus zwei Zaehlerstaenden sind.
+    private const RATE_SECTIONS = ['cpu', 'diskio', 'net'];
+
+    private bool    $stop       = false;
+    private array   $cfg        = [];
+    private array   $tiers      = [];
+    private array   $data       = [];
+    private array   $history    = [];
+    private float   $started    = 0.0;
+    private ?string $lastLogged = null;
+
+    public function __construct() {
+        // Absichtlich leer: autoload.php legt die Klasse auch bei jedem Web-Aufruf an.
+    }
+
+    /** Hauptschleife - kehrt erst nach SIGTERM/SIGINT zurueck. */
+    public function run(): bool {
+        if (PHP_SAPI !== 'cli') {
+            return $this->fail('cGaugePoller: run() laeuft nur auf der Kommandozeile');
+        }
+
+        $this->cfg = defined('CONFIG') ? (CONFIG['gauge'] ?? []) : [];
+        if (!$this->loadTiers()) return false;
+
+        $snapshot = trim((string) ($this->cfg['snapshot'] ?? ''));
+        if ($snapshot === '') {
+            return $this->fail('cGaugePoller: gauge.snapshot fehlt in config.json');
+        }
+
+        $sysinfo = $GLOBALS['cSysinfo'] ?? new cSysinfo();
+        $script  = $sysinfo->script();
+        if ($script === null) {
+            return $this->fail((string) $sysinfo->lastError);
+        }
+
+        if (function_exists('pcntl_async_signals')) {
+            pcntl_async_signals(true);
+            $halt = function (): void { $this->stop = true; };
+            pcntl_signal(SIGTERM, $halt);
+            pcntl_signal(SIGINT, $halt);
+        }
+
+        $this->started = microtime(true);
+        $this->log(sprintf(
+            'gestartet (PID %d), sysinfo %s, Takte: %s',
+            getmypid(),
+            $script,
+            implode(', ', array_map(static fn(string $n, array $t): string => "$n {$t['interval_ms']} ms",
+                                    array_keys($this->tiers), $this->tiers))
+        ));
+
+        // Vorlauf: Zaehlerstaende aus einem frueheren Lauf koennen Stunden alt sein.
+        // Ein Aufruf vorab ueberschreibt sie, damit schon der erste Takt nur seine
+        // eigene Zeitspanne mittelt.
+        $rate = array_values(array_intersect(self::RATE_SECTIONS, $this->allSections()));
+        if ($rate !== []) {
+            $sysinfo->raw($rate);
+        }
+
+        $next = array_fill_keys(array_keys($this->tiers), hrtime(true));
+
+        while (!$this->stop) {
+            $now = hrtime(true);
+            $due = array_keys(array_filter($next, static fn(int $t): bool => $t <= $now));
+
+            if ($due === []) {
+                $this->sleepNs(min($next) - $now);
+                continue;
+            }
+
+            // Faellige Takte teilen sich einen Aufruf. Da alle Takte am selben
+            // Startpunkt haengen, fallen z. B. 500 ms und 1 s exakt zusammen.
+            $sections = [];
+            foreach ($due as $name) {
+                $sections = array_merge($sections, $this->tiers[$name]['sections']);
+            }
+
+            // Zaehler zuerst: sysinfo arbeitet die Abschnitte der Reihe nach ab.
+            // Stuenden df oder nvidia-smi davor, laese es die Zaehler je nach
+            // Zusammensetzung des Aufrufs mal 10, mal 80 ms spaeter - und jede
+            // Rate haette eine andere Zeitbasis.
+            $sections = array_values(array_unique($sections));
+            usort($sections, static fn(string $a, string $b): int =>
+                (int) !in_array($a, self::RATE_SECTIONS, true) <=> (int) !in_array($b, self::RATE_SECTIONS, true));
+
+            // Zeitstempel vor dem Aufruf: die Zaehler liest sysinfo gleich zu Beginn,
+            // danach dauert der Aufruf je nach Abschnitten unterschiedlich lang.
+            $ts        = microtime(true);
+            $callStart = hrtime(true);
+            $result    = $sysinfo->read($sections);
+            $callEnd   = hrtime(true);
+
+            if ($result === null) {
+                $this->logOnce('Messung fehlgeschlagen: ' . $sysinfo->lastError);
+            } else {
+                $this->lastLogged = null;
+            }
+
+            foreach ($due as $name) {
+                $this->finishTier($name, $result, $sysinfo->lastError, $ts, $next[$name], $callStart, $callEnd);
+
+                $interval     = $this->tiers[$name]['interval_ns'];
+                $next[$name] += $interval;
+
+                // Verpasste Takte auslassen statt nachholen: nachgeholte Messungen
+                // kaemen dicht hintereinander und ihre Raten waeren ueber Sekunden-
+                // bruchteile gemittelt.
+                if ($next[$name] <= $callEnd) {
+                    $skip = intdiv($callEnd - $next[$name], $interval) + 1;
+                    $this->tiers[$name]['missed'] += $skip;
+                    $next[$name] += $skip * $interval;
+                }
+            }
+
+            $this->writeSnapshot($snapshot);
+        }
+
+        $this->log('beendet');
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Innenleben
+    // -----------------------------------------------------------------------
+
+    private function loadTiers(): bool {
+        $this->tiers = [];
+
+        foreach ((array) ($this->cfg['tiers'] ?? []) as $name => $tier) {
+            $sections = array_values((array) ($tier['sections'] ?? []));
+            $unknown  = array_diff($sections, array_keys(self::SECTION_KEYS));
+            $interval = (int) ($tier['interval_ms'] ?? 0);
+
+            if ($sections === [] || $unknown !== []) {
+                return $this->fail("cGaugePoller: Takt '$name' hat ungueltige sections: " . implode(', ', $unknown ?: ['(leer)']));
+            }
+            if ($interval < 100) {
+                return $this->fail("cGaugePoller: Takt '$name' braucht interval_ms >= 100");
+            }
+
+            $this->tiers[(string) $name] = [
+                'label'       => (string) ($tier['label'] ?? $name),
+                'interval_ms' => $interval,
+                'interval_ns' => $interval * 1_000_000,
+                'sections'    => $sections,
+                'keys'        => array_map(static fn(string $s): string => self::SECTION_KEYS[$s], $sections),
+                'history'     => max(0, (int) ($tier['history'] ?? 0)),
+                'seq'         => 0,
+                'ts'          => null,
+                'duration_ms' => null,
+                'jitter_ms'   => null,
+                'missed'      => 0,
+                'error'       => null,
+            ];
+        }
+
+        if ($this->tiers === []) {
+            return $this->fail('cGaugePoller: keine Takte unter gauge.tiers in config.json');
+        }
+        return true;
+    }
+
+    private function allSections(): array {
+        return array_values(array_unique(array_merge(...array_column($this->tiers, 'sections'))));
+    }
+
+    private function finishTier(string $name, ?array $result, ?string $error, float $ts, int $due, int $callStart, int $callEnd): void {
+        $tier = &$this->tiers[$name];
+
+        // Jitter = wie spaet die Messung gegenueber ihrem Soll-Zeitpunkt begann.
+        $tier['jitter_ms']   = round(($callStart - $due) / 1e6, 2);
+        $tier['duration_ms'] = round(($callEnd - $callStart) / 1e6, 1);
+
+        if ($result === null) {
+            $tier['error'] = $error;
+            return;
+        }
+
+        $tier['seq']++;
+        $tier['ts']    = round($ts, 3);
+        $tier['error'] = null;
+
+        $point = [];
+        foreach ($tier['keys'] as $key) {
+            if (!array_key_exists($key, $result)) continue;
+            $this->data[$key] = $this->filter($key, $result[$key]);
+            $point += $this->historyPoint($key, $this->data[$key]);
+        }
+
+        if ($tier['history'] > 0 && $point !== []) {
+            $this->pushHistory($name, round($ts, 3), $point, $tier['history']);
+        }
+    }
+
+    /** Schnittstellen und Mountpunkte ausblenden, die auf dem Kiosk nur stoeren. */
+    private function filter(string $key, mixed $value): mixed {
+        if ($key === 'network') {
+            $exclude  = (array) ($this->cfg['network']['exclude'] ?? ['lo']);
+            $hideDown = (bool) ($this->cfg['network']['hide_down'] ?? true);
+
+            return array_values(array_filter($value, function (array $if) use ($exclude, $hideDown): bool {
+                if ($hideDown && $if['state'] === 'down') return false;
+                return !$this->matches($if['interface'], $exclude);
+            }));
+        }
+
+        if ($key === 'filesystems') {
+            $exclude = (array) ($this->cfg['storage']['exclude_mounts'] ?? []);
+            return array_values(array_filter($value, fn(array $fs): bool => !$this->matches($fs['mount'], $exclude)));
+        }
+
+        return $value;
+    }
+
+    private function matches(string $name, array $patterns): bool {
+        foreach ($patterns as $pattern) {
+            if (fnmatch((string) $pattern, $name)) return true;
+        }
+        return false;
+    }
+
+    /** Welche Werte eines Abschnitts in den Verlauf fuer die Diagramme gehen. */
+    private function historyPoint(string $key, mixed $value): array {
+        $point = [];
+
+        switch ($key) {
+            case 'cpu':
+                $point['total'] = $value['total'];
+                break;
+            case 'memory':
+                $point['used'] = $value['used'];
+                break;
+            case 'network':
+                foreach ($value as $if) {
+                    $point['rx:' . $if['interface']] = $if['rx_bps'];
+                    $point['tx:' . $if['interface']] = $if['tx_bps'];
+                }
+                break;
+            case 'disk_io':
+                foreach ($value as $dev) {
+                    $point['read:' . $dev['device']]   = $dev['read_bps'];
+                    $point['write:' . $dev['device']]  = $dev['write_bps'];
+                    $point['active:' . $dev['device']] = $dev['active_percent'];
+                }
+                break;
+        }
+
+        return $point;
+    }
+
+    /**
+     * Ringpuffer als Spalten: ein Zeitstempel-Array und je Serie ein Werte-Array
+     * gleicher Laenge. Taucht eine Serie neu auf (Schnittstelle angesteckt),
+     * wird sie vorne mit null aufgefuellt, damit die Indizes zusammenpassen.
+     */
+    private function pushHistory(string $name, float $ts, array $point, int $max): void {
+        $h   = $this->history[$name] ?? ['t' => [], 'series' => []];
+        $len = count($h['t']);
+
+        $h['t'][] = $ts;
+
+        foreach (array_keys($point) as $key) {
+            if (!isset($h['series'][$key])) {
+                $h['series'][$key] = array_fill(0, $len, null);
+            }
+        }
+        foreach ($h['series'] as $key => $values) {
+            $values[] = $point[$key] ?? null;
+            $h['series'][$key] = $values;
+        }
+
+        $cut = count($h['t']) - $max;
+        if ($cut > 0) {
+            $h['t'] = array_slice($h['t'], $cut);
+            foreach ($h['series'] as $key => $values) {
+                $values = array_slice($values, $cut);
+                // Serie ohne einen einzigen Wert mehr (Schnittstelle weg): entfernen.
+                if (array_filter($values, static fn($v): bool => $v !== null) === []) {
+                    unset($h['series'][$key]);
+                } else {
+                    $h['series'][$key] = $values;
+                }
+            }
+        }
+
+        $this->history[$name] = $h;
+    }
+
+    private function writeSnapshot(string $file): void {
+        $tiers = [];
+        foreach ($this->tiers as $name => $tier) {
+            unset($tier['interval_ns']);
+            $tiers[$name] = $tier;
+        }
+
+        $json = json_encode([
+            'version'   => 1,
+            'generated' => round(microtime(true), 3),
+            'poller'    => [
+                'pid'     => getmypid(),
+                'started' => round($this->started, 3),
+            ],
+            'tiers'   => $tiers,
+            'data'    => $this->data,
+            'history' => $this->history,
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+
+        if ($json === false) {
+            $this->logOnce('Snapshot nicht kodierbar: ' . json_last_error_msg());
+            return;
+        }
+
+        $dir = dirname($file);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+
+        // tmp + rename: der Webserver liest nie eine halb geschriebene Datei.
+        $tmp = $file . '.tmp';
+        if (@file_put_contents($tmp, $json) === false || !@rename($tmp, $file)) {
+            $this->logOnce("Snapshot nicht schreibbar: $file");
+        }
+    }
+
+    private function sleepNs(int $ns): void {
+        if ($ns <= 0) return;
+        // Unterbricht ein Signal den Schlaf, prueft die Schleife ohnehin $stop.
+        @time_nanosleep(intdiv($ns, 1_000_000_000), $ns % 1_000_000_000);
+    }
+
+    private function log(string $message): void {
+        $cLog = $GLOBALS['cLog'] ?? null;
+        if ($cLog instanceof cLog) {
+            $cLog->log('poller.log', 'cGaugePoller: ' . $message);
+        }
+    }
+
+    // Ein haengendes sysinfo wuerde sonst zweimal pro Sekunde dieselbe Zeile loggen.
+    private function logOnce(string $message): void {
+        if ($message === $this->lastLogged) return;
+        $this->lastLogged = $message;
+        $this->log($message);
+    }
+
+    private function fail(string $message): false {
+        $this->lastError = $message;
+        $this->log($message);
+        return false;
+    }
+}
