@@ -13,11 +13,13 @@ class cSysinfo {
     public ?string $lastError = null;
 
     // Mehr kennt sysinfo nicht - ein unbekannter Abschnitt bricht dort mit Code 2 ab.
-    public const SECTIONS = ['system', 'cpu', 'temp', 'mem', 'disk', 'gpu', 'diskio', 'net'];
+    public const SECTIONS = ['system', 'cpu', 'temp', 'mem', 'disk', 'gpu', 'diskio', 'net', 'wan'];
 
     private array   $candidates;
     private ?string $stateDir;
     private int     $timeout;
+    private ?string $wanUrl;
+    private int     $wanTimeout;
 
     public function __construct(?array $options = null) {
         $cfg = $options ?? (defined('CONFIG') ? (CONFIG['gauge'] ?? []) : []);
@@ -28,6 +30,12 @@ class cSysinfo {
         $this->stateDir = $state === '' ? null : rtrim($state, '/');
 
         $this->timeout = max(1, (int) ($cfg['call_timeout'] ?? 5));
+
+        $url = trim((string) ($cfg['wan']['url'] ?? ''));
+        $this->wanUrl = $url === '' ? null : $url;
+        // Unter call_timeout: sonst wuerde sysinfo abgeschossen, bevor curl
+        // selbst "timeout" meldet, und der Takt stuende als Messfehler da.
+        $this->wanTimeout = max(1, min((int) ($cfg['wan']['timeout'] ?? 3), $this->timeout - 1));
     }
 
     /** Erstes vorhandene sysinfo aus gauge.sysinfo. */
@@ -49,6 +57,22 @@ class cSysinfo {
 
     /** JSON von sysinfo, so wie es kommt. */
     public function raw(array $sections = []): ?array {
+        $job = $this->start($sections);
+        if ($job === null) return null;
+
+        $jobs = [$job];
+        while (!$jobs[0]['done']) {
+            $this->pump($jobs, $jobs[0]['deadline'] - microtime(true));
+        }
+        return $this->finish($jobs[0]);
+    }
+
+    /**
+     * sysinfo starten, ohne auf das Ergebnis zu warten. Der Poller braucht das
+     * fuer Abschnitte, die auf einen fremden Server warten: seine lokalen Takte
+     * laufen weiter, bis pump() den Job als fertig meldet und finish() ihn abholt.
+     */
+    public function start(array $sections = []): ?array {
         $script = $this->script();
         if ($script === null) return null;
 
@@ -69,6 +93,10 @@ class cSysinfo {
         if ($this->stateDir !== null) {
             $env['SYSINFO_STATE_DIR'] = $this->stateDir;
         }
+        if ($this->wanUrl !== null) {
+            $env['SYSINFO_WAN_URL'] = $this->wanUrl;
+        }
+        $env['SYSINFO_WAN_TIMEOUT'] = (string) $this->wanTimeout;
 
         $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
         if (!is_resource($proc)) {
@@ -76,14 +104,80 @@ class cSysinfo {
             return null;
         }
 
-        [$out, $err, $timedOut] = $this->collect($pipes);
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+
+        return [
+            'proc'      => $proc,
+            'pipes'     => $pipes,
+            'deadline'  => microtime(true) + $this->timeout,
+            'out'       => '',
+            'err'       => '',
+            'done'      => false,
+            'timed_out' => false,
+        ];
+    }
+
+    /**
+     * Liest von allen laufenden Jobs, was anliegt, und wartet dabei hoechstens
+     * $wait Sekunden. Der Poller schlaeft hier statt in time_nanosleep(): so
+     * wacht er auf, sobald ein Hintergrund-Aufruf fertig ist.
+     */
+    public function pump(array &$jobs, float $wait = 0.0): void {
+        $now  = microtime(true);
+        $read = [];
+
+        foreach ($jobs as &$job) {
+            if ($job['done']) continue;
+            if ($now >= $job['deadline']) {
+                $job['done'] = $job['timed_out'] = true;
+                continue;
+            }
+            $open = array_filter([$job['pipes'][1], $job['pipes'][2]], static fn($p): bool => !feof($p));
+            if ($open === []) {
+                $job['done'] = true;
+                continue;
+            }
+            $wait = min($wait, $job['deadline'] - $now);
+            array_push($read, ...$open);
+        }
+        unset($job);
+
+        if ($read === []) return;
+
+        $wait  = max(0.0, $wait);
+        $write = $except = null;
+        // false = von einem Signal unterbrochen (SIGTERM an den Poller) - der Aufrufer prueft ohnehin erneut.
+        if (@stream_select($read, $write, $except, (int) $wait, (int) (fmod($wait, 1) * 1e6)) === false) {
+            return;
+        }
+
+        foreach ($jobs as &$job) {
+            if ($job['done']) continue;
+            foreach ([1 => 'out', 2 => 'err'] as $fd => $buffer) {
+                if (in_array($job['pipes'][$fd], $read, true)) {
+                    $job[$buffer] .= (string) fread($job['pipes'][$fd], 65536);
+                }
+            }
+            if (feof($job['pipes'][1]) && feof($job['pipes'][2])) {
+                $job['done'] = true;
+            }
+        }
+        unset($job);
+    }
+
+    /** Job abschliessen und sein JSON liefern; ein noch laufender Job wird beendet. */
+    public function finish(array $job): ?array {
+        $timedOut = $job['timed_out'] || !$job['done'];
+        $out      = $job['out'];
+        $err      = $job['err'];
 
         if ($timedOut) {
-            proc_terminate($proc, 9);
+            proc_terminate($job['proc'], 9);
         }
-        fclose($pipes[1]);
-        fclose($pipes[2]);
-        $code = proc_close($proc);
+        fclose($job['pipes'][1]);
+        fclose($job['pipes'][2]);
+        $code = proc_close($job['proc']);
 
         if ($timedOut) {
             $this->lastError = "cSysinfo: sysinfo nach {$this->timeout} s abgebrochen";
@@ -207,43 +301,28 @@ class cSysinfo {
             $out['network'] = $net;
         }
 
+        if (isset($raw['wan']) && is_array($raw['wan'])) {
+            $w     = $raw['wan'];
+            $ip    = trim((string) ($w['ip'] ?? ''));
+            $error = trim((string) ($w['error'] ?? ''));
+
+            // Kein Internet ist ein Messwert, kein Messfehler: error steht in den
+            // Daten, der Takt selbst bleibt fehlerfrei.
+            $out['wan'] = [
+                'ip'          => $ip === '' ? null : $ip,
+                'latency_ms'  => isset($w['latency_ms']) ? round((float) $w['latency_ms'], 1) : null,
+                'response_ms' => isset($w['response_ms']) ? round((float) $w['response_ms'], 1) : null,
+                'error'       => $error === '' ? null : $error,
+                'server'      => (string) parse_url((string) ($w['url'] ?? ''), PHP_URL_HOST),
+            ];
+        }
+
         return $out;
     }
 
     // -----------------------------------------------------------------------
     // Innenleben
     // -----------------------------------------------------------------------
-
-    /** stdout und stderr lesen, bis sysinfo fertig ist oder die Zeit um ist. */
-    private function collect(array $pipes): array {
-        stream_set_blocking($pipes[1], false);
-        stream_set_blocking($pipes[2], false);
-
-        $out = $err = '';
-        $deadline = microtime(true) + $this->timeout;
-
-        while (!feof($pipes[1]) || !feof($pipes[2])) {
-            $left = $deadline - microtime(true);
-            if ($left <= 0) {
-                return [$out, $err, true];
-            }
-
-            $read = array_values(array_filter([$pipes[1], $pipes[2]], static fn($p): bool => !feof($p)));
-            $write = $except = null;
-
-            // false = von einem Signal unterbrochen (SIGTERM an den Poller) - einfach weiterlesen.
-            if (@stream_select($read, $write, $except, (int) $left, (int) (fmod($left, 1) * 1e6)) === false) {
-                continue;
-            }
-
-            foreach ($read as $pipe) {
-                $chunk = (string) fread($pipe, 65536);
-                if ($pipe === $pipes[1]) $out .= $chunk; else $err .= $chunk;
-            }
-        }
-
-        return [$out, $err, false];
-    }
 
     private function memory(array $m): array {
         $total = $this->bytes($m, 'total');

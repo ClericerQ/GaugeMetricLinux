@@ -2,15 +2,22 @@
 
 # Usage:
 #   sysinfo                          interactive terminal view
-#   sysinfo json                     all sections as JSON
+#   sysinfo json                     all local sections as JSON
 #   sysinfo json cpu mem net ...     only the given sections
 #
-# Sections: system cpu temp mem disk gpu diskio net
+# Sections: system cpu temp mem disk gpu diskio net wan
+#
+# "wan" (public IP and latency) sends a request to the internet and is only
+# included when asked for by name - a plain "sysinfo json" stays offline.
+# SYSINFO_WAN_URL overrides the server, SYSINFO_WAN_TIMEOUT its timeout (s).
 #
 # SYSINFO_STATE_DIR=/some/dir keeps the counter state for the rate values
 # (cpu, diskio, net) in that directory. A background poller sets it so that
 # every value covers exactly the time since its previous call - and so that
 # an interactive sysinfo running at the same time does not skew its rates.
+
+WAN_URL="${SYSINFO_WAN_URL:-https://dirin.eu/wanip/index.php}"
+WAN_TIMEOUT="${SYSINFO_WAN_TIMEOUT:-3}"
 
 STATE_DIR="${SYSINFO_STATE_DIR:-}"
 if [ -n "$STATE_DIR" ]; then
@@ -242,6 +249,49 @@ get_net_io() {
     return 0
 }
 
+get_wan_info() {
+    # Returns: ip|latency_ms|response_ms|error
+    # The server answers with the caller's address as plain text. Latency is the
+    # TCP handshake - one round trip like ping, which firewalls often drop.
+    # The response time adds DNS, TLS and the request itself.
+    local out rc code dns conn total ip lat resp err
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "|||no-curl"
+        return
+    fi
+
+    # -w still prints after a failed transfer (http_code 000), so the last line
+    # is always the timing line and everything before it is the body.
+    out=$(curl -s -m "$WAN_TIMEOUT" -H 'Cache-Control: no-cache' \
+        -w '\n%{http_code} %{time_namelookup} %{time_connect} %{time_total}' "$WAN_URL" 2>/dev/null)
+    rc=$?
+    read -r code dns conn total <<< "${out##*$'\n'}"
+    ip=${out%$'\n'*}
+    [ "$ip" == "$out" ] && ip=""
+    ip=${ip//[$' \t\r\n']/}
+
+    case $rc in
+        0)  err="" ;;
+        6)  err="dns" ;;
+        7)  err="connect" ;;
+        28) err="timeout" ;;
+        35|51|53|54|58|59|60|77|83|90|91) err="tls" ;;
+        *)  err="curl-$rc" ;;
+    esac
+    if [ -z "$err" ] && [ "$code" != "200" ]; then
+        err="http-$code"
+    fi
+    # Anything but a bare address (error page, captive portal) is not our IP.
+    if ! [[ "$ip" =~ ^[0-9a-fA-F:.]{2,45}$ && "$ip" =~ [.:] ]]; then
+        ip=""
+        [ -z "$err" ] && err="no-ip"
+    fi
+
+    lat=$(awk -v d="$dns" -v c="$conn" 'BEGIN { if (c > 0) printf "%.1f", (c - d) * 1000 }')
+    [ $rc -eq 0 ] && resp=$(awk -v t="$total" 'BEGIN { printf "%.1f", t * 1000 }')
+    echo "$ip|$lat|$resp|$err"
+}
+
 # --- JSON sections ---
 
 json_system() {
@@ -347,6 +397,13 @@ json_net() {
     echo -n "  ]"
 }
 
+json_wan() {
+    local ip lat resp err
+    IFS='|' read -r ip lat resp err <<< "$(get_wan_info)"
+    printf '  "wan": {"ip": "%s", "latency_ms": %s, "response_ms": %s, "error": "%s", "url": "%s"}' \
+        "$ip" "${lat:-null}" "${resp:-null}" "$err" "$(json_escape "$WAN_URL")"
+}
+
 # --- Output Logic ---
 
 if [ "$1" == "json" ]; then
@@ -373,6 +430,7 @@ if [ "$1" == "json" ]; then
             gpu)    parts+=("$(json_gpu)") ;;
             diskio) parts+=("$(json_diskio)") ;;
             net)    parts+=("$(json_net)") ;;
+            wan)    parts+=("$(json_wan)") ;;
             *)      echo "sysinfo: unknown section '$s'" >&2; exit 2 ;;
         esac
     done

@@ -1,6 +1,6 @@
 {
     "info": {
-        "version": "1.0",
+        "version": "1.1",
         "name": "GaugeMetricLinux"
     },
     "database": {
@@ -20,7 +20,8 @@
         ],
         "pid_file": "{dir}log/webserver.pid",
         "lock_file": "{dir}log/webserver.lock",
-        "access_log": "{dir}log/webserver.log"
+        "access_log": "{dir}log/webserver.log",
+        "start_poller": true
     },
     "kiosk": {
         "mode": "auto",
@@ -59,7 +60,12 @@
             "sensors": { "label": "Sensoren",          "interval_ms": 2000,  "sections": ["temp", "gpu"], "history": 0 },
             "diskio":  { "label": "Datenträger-I/O","interval_ms": 2000,  "sections": ["diskio"], "history": 90 },
             "storage": { "label": "Laufwerke",         "interval_ms": 10000, "sections": ["disk"],   "history": 0 },
-            "system":  { "label": "System",            "interval_ms": 5000,  "sections": ["system"], "history": 0 }
+            "system":  { "label": "System",            "interval_ms": 5000,  "sections": ["system"], "history": 0 },
+            "wan":     { "label": "Internet",          "interval_ms": 10000, "sections": ["wan"],    "history": 90 }
+        },
+        "wan": {
+            "url": "https://dirin.eu/wanip/index.php",
+            "timeout": 3
         },
         "network": {
             "exclude": ["lo", "veth*", "docker*", "br-*", "virbr*", "tap*", "fwbr*", "fwpr*", "fwln*"],
