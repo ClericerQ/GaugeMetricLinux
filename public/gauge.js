@@ -23,7 +23,7 @@
     const HEAT = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7', '#6da7ec', '#86b6ef'];
 
     // Welche Karte zeigt welchen Datenschluessel des Snapshots
-    const CARDS = { cpu: 'card-cpu', memory: 'card-mem', network: 'card-net', disk_io: 'card-io', filesystems: 'card-fs', temperatures: 'sensors', wan: 'net-wan' };
+    const CARDS = { cpu: 'card-cpu', memory: 'card-mem', network: 'card-net', gpus: 'card-gpu', disk_io: 'card-io', filesystems: 'card-fs', temperatures: 'sensors', wan: 'net-wan' };
 
     // Kurzcodes aus sysinfo (Abschnitt wan) -> Anzeigetext
     const WAN_ERRORS = {
@@ -299,7 +299,7 @@
         seqs: {},
         hist: {},
         charts: {},
-        rows: { net: new Map(), io: new Map() },
+        rows: { net: new Map(), io: new Map(), gpu: new Map() },
         link: null,
     };
 
@@ -432,12 +432,11 @@
             .replace(/^nvme /, 'NVMe ');
     }
 
-    function renderSensors(temps, gpus) {
+    function renderSensors(temps) {
         const host = $('sensor-chips');
         host.textContent = '';
 
         temps = temps || [];
-        gpus = gpus || [];
 
         const cpuTemps = temps.filter((t) => t.group === 'cpu');
         const cpuMax = cpuTemps.length ? Math.max(...cpuTemps.map((t) => t.celsius)) : null;
@@ -458,10 +457,6 @@
         for (const t of shown) {
             const level = t.celsius >= SENSOR_CRIT ? 'crit' : t.celsius >= SENSOR_WARN ? 'warn' : '';
             chip(sensorLabel(t.label), num(t.celsius) + ' °C', level);
-        }
-        for (const g of gpus) {
-            const parts = [ok(g.percent) && pct(g.percent), ok(g.celsius) && num(g.celsius) + ' °C', ok(g.watt) && num(g.watt) + ' W'].filter(Boolean);
-            chip(`GPU ${g.id} ${g.name}`, parts.join(' · ') || '–', ok(g.celsius) && g.celsius >= SENSOR_WARN ? 'warn' : '');
         }
         if (!host.children.length) host.append(el('span', 'empty', 'Keine Sensoren gefunden'));
     }
@@ -579,6 +574,56 @@
             format: (v) => num(v) + ' ms',
         }));
         feed(chart, 'wan');
+    }
+
+    function renderGpus(list) {
+        const host = $('gpu-list');
+        const seen = new Set();
+
+        for (const g of list) {
+            const id = String(g.id);
+            seen.add(id);
+
+            // Unified Memory (DGX Spark) meldet keinen eigenen Grafikspeicher: dann
+            // weder Wert noch Linie, statt dauerhaft "–" und einer leeren Serie
+            const hasMem = ok(g.memory_total);
+            let r = state.rows.gpu.get(id);
+            if (r && r.hasMem !== hasMem) { r.row.remove(); r = null; }
+            if (!r) {
+                const labels = [['Auslastung', C.s1]];
+                const series = [{ key: 'util:' + id, label: 'Auslastung', color: C.s1, fill: true }];
+                if (hasMem) {
+                    labels.push(['Grafikspeicher', C.s2]);
+                    series.push({ key: 'mem:' + id, label: 'Grafikspeicher', color: C.s2 });
+                }
+                r = buildRow(host, labels, { series, yMax: 100, format: (v) => pct(v) });
+                r.hasMem = hasMem;
+                state.rows.gpu.set(id, r);
+            }
+
+            // Bei einer Karte reicht der Name, bei mehreren braucht es den Index
+            r.name.textContent = (list.length > 1 ? `GPU ${id} · ` : '') + g.name;
+            r.name.title = g.name;
+
+            r.meta.textContent = '';
+            if (ok(g.celsius)) {
+                const level = g.celsius >= SENSOR_CRIT ? 'crit' : g.celsius >= SENSOR_WARN ? 'warn' : '';
+                r.meta.append(el('b', level, (level ? '⚠ ' : '') + num(g.celsius) + ' °C'));
+            }
+            const power = ok(g.watt) ? num(g.watt) + (ok(g.watt_limit) ? ' / ' + num(g.watt_limit) : '') + ' W' : '';
+            if (power) r.meta.append(document.createTextNode((r.meta.childNodes.length ? ' · ' : '') + power));
+
+            r.values[0].textContent = pct(g.percent);
+            r.values[1].textContent = pct(g.memory_percent);
+            r.foot.textContent = [
+                ok(g.memory_total) && `${bytes(g.memory_used)} von ${bytes(g.memory_total)}`,
+                ok(g.fan_percent) && 'Lüfter ' + pct(g.fan_percent),
+                g.pstate,
+                g.driver && 'Treiber ' + g.driver,
+            ].filter(Boolean).join(' · ') || ' ';
+            feed(r.chart, 'gpus');
+        }
+        dropMissing(state.rows.gpu, seen, host);
     }
 
     function renderDiskIo(list) {
@@ -745,12 +790,18 @@
 
         if (d.system && fresh('system')) renderSystem(d.system);
         if (d.cpu && fresh('cpu')) { renderCpu(d.cpu); beat('card-cpu'); }
-        if (d.temperatures && fresh('temperatures')) { renderSensors(d.temperatures, d.gpus); beat('sensors'); }
+        if (d.temperatures && fresh('temperatures')) { renderSensors(d.temperatures); beat('sensors'); }
         if (d.memory && fresh('memory')) { renderMemory(d.memory); beat('card-mem'); }
         if (d.network && fresh('network')) { renderNetwork(d.network); beat('card-net'); }
         // Ohne wan-Takt in config.json bleibt der Block aus, statt ewig "–" zu zeigen
         $('net-wan').hidden = !tierOf('wan')[0];
         if (d.wan && fresh('wan')) { renderWan(d.wan); beat('net-wan'); }
+        // Grafikkarte nur, wenn nvidia-smi eine meldet - sonst behalten I/O und
+        // Laufwerke ihre volle Breite
+        const hasGpu = !!tierOf('gpus')[0] && (d.gpus || []).length > 0;
+        $('card-gpu').hidden = !hasGpu;
+        $('grid').classList.toggle('has-gpu', hasGpu);
+        if (hasGpu && fresh('gpus')) { renderGpus(d.gpus); beat('card-gpu'); }
         if (d.disk_io && fresh('disk_io')) { renderDiskIo(d.disk_io); beat('card-io'); }
         if (d.filesystems && fresh('filesystems')) { renderFilesystems(d.filesystems); beat('card-fs'); }
 

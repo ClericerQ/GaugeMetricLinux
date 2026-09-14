@@ -12,7 +12,9 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   bestehende JSON-Schluessel behalten ihr Format. Abschnitt `wan` (oeffentliche
   IP, Latenz per HTTP an `gauge.wan.url`) nur auf ausdruecklichen Wunsch; der
   Poller startet ihn als eigenen Prozess, damit ein haengender Server die
-  lokalen Takte nicht aufhaelt.
+  lokalen Takte nicht aufhaelt. Ebenso `gpu` (nvidia-smi, eigener Takt): ohne
+  Persistence Mode dauert ein Aufruf bis zu Sekunden. Die Grafikkarten-Karte
+  erscheint nur, wenn eine Karte gemeldet wird.
 - `app/cSysinfo.php` - ruft sysinfo auf und macht aus den Strings Zahlen.
 - `app/cGaugePoller.php` - Backpoller: misst in Takten (`gauge.tiers`), schreibt
   `db/metrics.json` (tmp + rename). Start/Stopp ueber `poller.sh`.

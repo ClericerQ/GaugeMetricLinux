@@ -124,8 +124,25 @@ get_filesystems() {
 }
 
 get_gpu_info() {
-    # Returns: Name|Temp|Power|Util
-    nvidia-smi --query-gpu=name,temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf "%s|%sC|%sW|%s%%\n", $1, $2, $3, $4}'
+    # Returns: name|temp|power|util|index|mem_used_bytes|mem_total_bytes|power_limit_w|fan_percent|pstate|driver
+    # The first four keep their old form ("53C", "120.5W", "30%"). The rest are
+    # plain numbers, empty where the card answers [N/A] - e.g. no own VRAM on
+    # unified memory systems, no fan on passively cooled cards.
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    # name last: it is the only field that could ever contain a comma.
+    # timeout: a wedged driver makes nvidia-smi hang instead of failing.
+    LC_ALL=C timeout 3 nvidia-smi \
+        --query-gpu=index,temperature.gpu,power.draw,utilization.gpu,memory.used,memory.total,power.limit,fan.speed,pstate,driver_version,name \
+        --format=csv,noheader,nounits 2>/dev/null |
+        awk -F', *' '
+        function n(v) { return v ~ /^[0-9]+(\.[0-9]+)?$/ ? v : "" }
+        function mib(v) { return n(v) == "" ? "" : sprintf("%.0f", v * 1048576) }
+        # Driver errors ("NVIDIA-SMI has failed ...") also go to stdout
+        NF >= 11 && $1 ~ /^[0-9]+$/ {
+            name = $11; for (i = 12; i <= NF; i++) name = name ", " $i;
+            printf "%s|%sC|%sW|%s%%|%s|%s|%s|%s|%s|%s|%s\n", name, $2, $3, $4, $1,
+                mib($5), mib($6), n($7), n($8), $9, $10
+        }'
 }
 
 cpu_snapshot() {
@@ -359,14 +376,17 @@ json_disk() {
 }
 
 json_gpu() {
-    local gpu_raw count i gname gtemp gpwr gutil
+    local gpu_raw count i gname gtemp gpwr gutil gidx mused mtotal plimit fan pstate driver
     mapfile -t gpu_raw < <(get_gpu_info)
     echo "  \"gpus\": ["
     count=${#gpu_raw[@]}
     for ((i=0; i<$count; i++)); do
-        IFS='|' read -r gname gtemp gpwr gutil <<< "${gpu_raw[$i]}"
-        printf "    {\"id\": %d, \"name\": \"%s\", \"temp\": \"%s\", \"power\": \"%s\", \"utilization\": \"%s\"}%s\n" \
-            "$i" "$(json_escape "$gname")" "$gtemp" "$gpwr" "$gutil" "$([ $i -lt $((count-1)) ] && echo ',')"
+        IFS='|' read -r gname gtemp gpwr gutil gidx mused mtotal plimit fan pstate driver <<< "${gpu_raw[$i]}"
+        printf '    {"id": %d, "name": "%s", "temp": "%s", "power": "%s", "utilization": "%s", "memory_used_bytes": %s, "memory_total_bytes": %s, "power_limit_w": %s, "fan_percent": %s, "pstate": "%s", "driver": "%s"}%s\n' \
+            "${gidx:-$i}" "$(json_escape "$gname")" "$gtemp" "$gpwr" "$gutil" \
+            "${mused:-null}" "${mtotal:-null}" "${plimit:-null}" "${fan:-null}" \
+            "$(json_escape "$pstate")" "$(json_escape "$driver")" \
+            "$([ $i -lt $((count-1)) ] && echo ',')"
     done
     echo -n "  ]"
 }

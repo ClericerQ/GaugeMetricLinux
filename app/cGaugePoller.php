@@ -30,9 +30,11 @@ class cGaugePoller {
     // Abschnitte, deren Werte Raten aus zwei Zaehlerstaenden sind.
     private const RATE_SECTIONS = ['cpu', 'diskio', 'net'];
 
-    // Abschnitte, die auf einen fremden Server warten. Ihr Takt laeuft als eigener
-    // Prozess: haengt der Server bis zum Timeout, misst die CPU trotzdem weiter.
-    private const BACKGROUND_SECTIONS = ['wan'];
+    // Abschnitte, die unberechenbar lange brauchen koennen. Ihr Takt laeuft als
+    // eigener Prozess, damit die CPU trotzdem im Takt weitermisst: wan wartet auf
+    // einen fremden Server, nvidia-smi ohne Persistence Mode laedt bei jedem
+    // Aufruf den Treiber neu und braucht dann gern eine Sekunde und mehr.
+    private const BACKGROUND_SECTIONS = ['wan', 'gpu'];
 
     private bool    $stop       = false;
     private array   $cfg        = [];
@@ -184,12 +186,14 @@ class cGaugePoller {
                 return $this->fail("cGaugePoller: Takt '$name' braucht interval_ms >= 100");
             }
 
-            // Gemischt ginge nicht gut: ein zweiter sysinfo-Prozess mit cpu oder net
-            // wuerde neben dem Haupttakt dieselben Zaehlerstaende fortschreiben.
+            // Ein Hintergrund-Takt nimmt alle seine Abschnitte mit in den eigenen
+            // Prozess. Fuer temp o. ae. ist das egal - aber ein zweiter Prozess mit
+            // cpu oder net wuerde neben dem Haupttakt dieselben Zaehlerstaende fortschreiben.
             $background = array_intersect($sections, self::BACKGROUND_SECTIONS) !== [];
-            if ($background && array_diff($sections, self::BACKGROUND_SECTIONS) !== []) {
-                return $this->fail("cGaugePoller: Takt '$name' mischt " . implode(', ', self::BACKGROUND_SECTIONS)
-                    . ' mit lokalen Abschnitten - bitte in einen eigenen Takt');
+            $rates      = array_intersect($sections, self::RATE_SECTIONS);
+            if ($background && $rates !== []) {
+                return $this->fail("cGaugePoller: Takt '$name' mischt " . implode(', ', array_intersect($sections, self::BACKGROUND_SECTIONS))
+                    . ' mit ' . implode(', ', $rates) . ' - bitte in einen eigenen Takt');
             }
 
             $this->tiers[(string) $name] = [
@@ -364,6 +368,12 @@ class cGaugePoller {
                     $point['read:' . $dev['device']]   = $dev['read_bps'];
                     $point['write:' . $dev['device']]  = $dev['write_bps'];
                     $point['active:' . $dev['device']] = $dev['active_percent'];
+                }
+                break;
+            case 'gpus':
+                foreach ($value as $gpu) {
+                    $point['util:' . $gpu['id']] = $gpu['percent'];
+                    $point['mem:' . $gpu['id']]  = $gpu['memory_percent'] ?? null;
                 }
                 break;
             case 'wan':

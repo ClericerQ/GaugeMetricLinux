@@ -3,8 +3,10 @@
  * Kiosk-Dashboard - eine Seite, alle Werte auf einen Blick.
  *
  * Die Karten stehen in der Reihenfolge ihrer Abtastrate: CPU, Arbeitsspeicher,
- * Netzwerk, Datentraeger-I/O, Laufwerke. Die Werte selbst holt gauge.js ueber
- * /api/metrics; hier wird nur das Geruest und die Konfiguration ausgeliefert.
+ * Netzwerk, Grafikkarte, Datentraeger-I/O, Laufwerke. Die Grafikkarte blendet
+ * gauge.js erst ein, wenn nvidia-smi eine meldet - ohne GPU bleibt das Raster
+ * wie gehabt. Die Werte selbst holt gauge.js ueber /api/metrics; hier wird nur
+ * das Geruest und die Konfiguration ausgeliefert.
  *
  * @var cRoute $cRoute
  * @var string $dir
@@ -68,7 +70,7 @@ $host = htmlspecialchars((string) gethostname(), ENT_QUOTES);
         </div>
     </header>
 
-    <main class="grid">
+    <main class="grid" id="grid">
 
         <section class="card" id="card-cpu" data-key="cpu">
             <header class="card-head">
@@ -140,6 +142,16 @@ $host = htmlspecialchars((string) gethostname(), ENT_QUOTES);
                 <div class="rows" id="net-list">
                     <p class="empty">Warte auf Messwerte &hellip;</p>
                 </div>
+            </div>
+        </section>
+
+        <section class="card" id="card-gpu" data-key="gpus" hidden>
+            <header class="card-head">
+                <h2>Grafikkarte</h2>
+                <span class="rate"><span class="stale-note" hidden></span><i class="pulse"></i><span class="every"></span></span>
+            </header>
+            <div class="card-body rows" id="gpu-list">
+                <p class="empty">Warte auf Messwerte &hellip;</p>
             </div>
         </section>
 

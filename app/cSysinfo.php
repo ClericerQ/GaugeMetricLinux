@@ -259,12 +259,24 @@ class cSysinfo {
         if (isset($raw['gpus'])) {
             $gpus = [];
             foreach ((array) $raw['gpus'] as $gpu) {
+                $memUsed  = isset($gpu['memory_used_bytes']) ? (int) $gpu['memory_used_bytes'] : null;
+                $memTotal = isset($gpu['memory_total_bytes']) ? (int) $gpu['memory_total_bytes'] : null;
+
                 $gpus[] = [
-                    'id'      => (int) ($gpu['id'] ?? count($gpus)),
-                    'name'    => (string) ($gpu['name'] ?? 'GPU'),
-                    'celsius' => $this->number((string) ($gpu['temp'] ?? '')),
-                    'watt'    => $this->number((string) ($gpu['power'] ?? '')),
-                    'percent' => $this->number((string) ($gpu['utilization'] ?? '')),
+                    'id'           => (int) ($gpu['id'] ?? count($gpus)),
+                    'name'         => (string) ($gpu['name'] ?? 'GPU'),
+                    'celsius'      => $this->number((string) ($gpu['temp'] ?? '')),
+                    'watt'         => $this->number((string) ($gpu['power'] ?? '')),
+                    'watt_limit'   => isset($gpu['power_limit_w']) ? (float) $gpu['power_limit_w'] : null,
+                    'percent'      => $this->number((string) ($gpu['utilization'] ?? '')),
+                    'memory_used'  => $memUsed,
+                    'memory_total' => $memTotal,
+                    // Unified Memory (z. B. DGX Spark) meldet keinen eigenen VRAM:
+                    // null statt 0 %, sonst saehe es aus wie ein leerer Speicher.
+                    'memory_percent' => ($memUsed !== null && $memTotal > 0) ? round($memUsed / $memTotal * 100, 1) : null,
+                    'fan_percent'  => isset($gpu['fan_percent']) ? (float) $gpu['fan_percent'] : null,
+                    'pstate'       => (string) ($gpu['pstate'] ?? ''),
+                    'driver'       => (string) ($gpu['driver'] ?? ''),
                 ];
             }
             $out['gpus'] = $gpus;
