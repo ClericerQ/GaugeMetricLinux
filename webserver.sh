@@ -50,6 +50,10 @@ KIOSK_MARKER="--gaugemetric-kiosk=${DIR}"
 
 [[ "$KIOSK_WAIT" =~ ^[0-9]+$ ]] || KIOSK_WAIT=15
 
+# Ohne Poller zeigt das Dashboard nur einen alten Snapshot und graut aus.
+# POLLER=off ./webserver.sh startet nur den Webserver.
+POLLER_MODE="${POLLER:-$(cfg '.web.start_poller' 'true')}"
+
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "webserver: ungueltiger Port '$PORT'" >&2; exit 1; }
 [[ -d "$DOCROOT" ]]       || { echo "webserver: Doc-Root '$DOCROOT' fehlt" >&2; exit 1; }
 
@@ -68,6 +72,17 @@ banner() {
 serve() {
     echo "$BASHPID" > "$PID_FILE"
     exec php -S "${HOST}:${PORT}" -t "$DOCROOT" "${DOCROOT}index.php"
+}
+
+# poller.sh ist idempotent ("laeuft bereits" mit Exit 0). 9>&- gibt die
+# Webserver-Sperre nicht an den Poller weiter - sonst hielte ein langlebiger
+# Poller den Lock, und restart meldete "laeuft bereits".
+poller_start() {
+    case "$POLLER_MODE" in
+        off|false|0|no) return 0 ;;
+    esac
+    [[ -x "${DIR}poller.sh" ]] || { echo "webserver: ${DIR}poller.sh fehlt - Poller nicht gestartet" >&2; return 1; }
+    "${DIR}poller.sh" start 9>&- || { echo "webserver: Poller-Start fehlgeschlagen - Dashboard bleibt ohne Daten" >&2; return 1; }
 }
 
 # ---------------------------------------------------------------------------
@@ -317,6 +332,7 @@ start() {
     # Ein zweiter Aufruf oeffnet das Kiosk-Fenster wieder, falls es zugemacht wurde.
     flock -n 9 || {
         echo "webserver: laeuft bereits (PID $(cat "$PID_FILE" 2>/dev/null || echo '?')) - kein zweiter Start"
+        poller_start || true
         kiosk_start || true
         exit 0
     }
@@ -325,6 +341,7 @@ start() {
         banner
         # Vor dem exec: danach gibt es diese Shell nicht mehr. Der Kiosk wartet
         # selbst, bis der Port antwortet.
+        poller_start || true
         kiosk_start || true
         serve
     else
@@ -334,6 +351,7 @@ start() {
         if kill -0 "$pid" 2>/dev/null; then
             banner
             echo "webserver: gestartet (PID $pid), Log ${LOG_FILE}"
+            poller_start || true
             kiosk_start || true
         else
             echo "webserver: Start fehlgeschlagen - siehe ${LOG_FILE}" >&2
@@ -424,5 +442,5 @@ case "${1:-start}" in
                 KIOSK_MODE=on
                 kiosk_start ;;
     kiosk-stop) kiosk_stop ;;
-    *)          echo "Aufruf: [KIOSK=auto|on|off] $0 [start|stop|restart|status|foreground|kiosk|kiosk-stop]" >&2; exit 2 ;;
+    *)          echo "Aufruf: [KIOSK=auto|on|off] [POLLER=on|off] $0 [start|stop|restart|status|foreground|kiosk|kiosk-stop]" >&2; exit 2 ;;
 esac

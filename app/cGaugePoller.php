@@ -24,10 +24,15 @@ class cGaugePoller {
         'gpu'    => 'gpus',
         'diskio' => 'disk_io',
         'net'    => 'network',
+        'wan'    => 'wan',
     ];
 
     // Abschnitte, deren Werte Raten aus zwei Zaehlerstaenden sind.
     private const RATE_SECTIONS = ['cpu', 'diskio', 'net'];
+
+    // Abschnitte, die auf einen fremden Server warten. Ihr Takt laeuft als eigener
+    // Prozess: haengt der Server bis zum Timeout, misst die CPU trotzdem weiter.
+    private const BACKGROUND_SECTIONS = ['wan'];
 
     private bool    $stop       = false;
     private array   $cfg        = [];
@@ -86,15 +91,34 @@ class cGaugePoller {
         }
 
         $next = array_fill_keys(array_keys($this->tiers), hrtime(true));
+        $jobs = [];
 
         while (!$this->stop) {
+            if ($this->reapJobs($sysinfo, $jobs)) {
+                $this->writeSnapshot($snapshot);
+            }
+
             $now = hrtime(true);
             $due = array_keys(array_filter($next, static fn(int $t): bool => $t <= $now));
 
             if ($due === []) {
-                $this->sleepNs(min($next) - $now);
+                $this->waitNs($sysinfo, $jobs, min($next) - $now);
                 continue;
             }
+
+            $local = [];
+            foreach ($due as $name) {
+                if (!$this->tiers[$name]['background']) {
+                    $local[] = $name;
+                    continue;
+                }
+                $this->launchJob($sysinfo, $jobs, $name, $next[$name]);
+                $this->advance($name, $next[$name], hrtime(true));
+            }
+            if ($local === []) {
+                continue;
+            }
+            $due = $local;
 
             // Faellige Takte teilen sich einen Aufruf. Da alle Takte am selben
             // Startpunkt haengen, fallen z. B. 500 ms und 1 s exakt zusammen.
@@ -126,21 +150,15 @@ class cGaugePoller {
 
             foreach ($due as $name) {
                 $this->finishTier($name, $result, $sysinfo->lastError, $ts, $next[$name], $callStart, $callEnd);
-
-                $interval     = $this->tiers[$name]['interval_ns'];
-                $next[$name] += $interval;
-
-                // Verpasste Takte auslassen statt nachholen: nachgeholte Messungen
-                // kaemen dicht hintereinander und ihre Raten waeren ueber Sekunden-
-                // bruchteile gemittelt.
-                if ($next[$name] <= $callEnd) {
-                    $skip = intdiv($callEnd - $next[$name], $interval) + 1;
-                    $this->tiers[$name]['missed'] += $skip;
-                    $next[$name] += $skip * $interval;
-                }
+                $this->advance($name, $next[$name], $callEnd);
             }
 
             $this->writeSnapshot($snapshot);
+        }
+
+        // Ein noch wartendes curl soll den Poller nicht ueberleben.
+        foreach ($jobs as $job) {
+            $sysinfo->finish($job);
         }
 
         $this->log('beendet');
@@ -166,6 +184,14 @@ class cGaugePoller {
                 return $this->fail("cGaugePoller: Takt '$name' braucht interval_ms >= 100");
             }
 
+            // Gemischt ginge nicht gut: ein zweiter sysinfo-Prozess mit cpu oder net
+            // wuerde neben dem Haupttakt dieselben Zaehlerstaende fortschreiben.
+            $background = array_intersect($sections, self::BACKGROUND_SECTIONS) !== [];
+            if ($background && array_diff($sections, self::BACKGROUND_SECTIONS) !== []) {
+                return $this->fail("cGaugePoller: Takt '$name' mischt " . implode(', ', self::BACKGROUND_SECTIONS)
+                    . ' mit lokalen Abschnitten - bitte in einen eigenen Takt');
+            }
+
             $this->tiers[(string) $name] = [
                 'label'       => (string) ($tier['label'] ?? $name),
                 'interval_ms' => $interval,
@@ -173,6 +199,7 @@ class cGaugePoller {
                 'sections'    => $sections,
                 'keys'        => array_map(static fn(string $s): string => self::SECTION_KEYS[$s], $sections),
                 'history'     => max(0, (int) ($tier['history'] ?? 0)),
+                'background'  => $background,
                 'seq'         => 0,
                 'ts'          => null,
                 'duration_ms' => null,
@@ -190,6 +217,74 @@ class cGaugePoller {
 
     private function allSections(): array {
         return array_values(array_unique(array_merge(...array_column($this->tiers, 'sections'))));
+    }
+
+    /**
+     * Naechsten Soll-Zeitpunkt setzen. Verpasste Takte auslassen statt nachholen:
+     * nachgeholte Messungen kaemen dicht hintereinander und ihre Raten waeren
+     * ueber Sekundenbruchteile gemittelt.
+     */
+    private function advance(string $name, int &$next, int $now): void {
+        $interval = $this->tiers[$name]['interval_ns'];
+        $next    += $interval;
+
+        if ($next <= $now) {
+            $skip = intdiv($now - $next, $interval) + 1;
+            $this->tiers[$name]['missed'] += $skip;
+            $next += $skip * $interval;
+        }
+    }
+
+    private function launchJob(cSysinfo $sysinfo, array &$jobs, string $name, int $due): void {
+        // Vorige Messung haengt noch (Server antwortet nicht): nicht stapeln.
+        if (isset($jobs[$name])) {
+            $this->tiers[$name]['missed']++;
+            return;
+        }
+
+        $ts    = microtime(true);
+        $start = hrtime(true);
+        $job   = $sysinfo->start($this->tiers[$name]['sections']);
+
+        if ($job === null) {
+            $this->logOnce("Takt $name: " . $sysinfo->lastError);
+            $this->finishTier($name, null, $sysinfo->lastError, $ts, $due, $start, hrtime(true));
+            return;
+        }
+
+        $jobs[$name] = $job + ['ts' => $ts, 'due' => $due, 'started' => $start];
+    }
+
+    /** Fertige Hintergrund-Messungen abholen; true = es gibt Neues fuer den Snapshot. */
+    private function reapJobs(cSysinfo $sysinfo, array &$jobs): bool {
+        if ($jobs === []) return false;
+
+        $sysinfo->pump($jobs);
+
+        $changed = false;
+        foreach ($jobs as $name => $job) {
+            if (!$job['done']) continue;
+
+            $result = $sysinfo->finish($job);
+            if ($result !== null) {
+                $result = $sysinfo->normalize($result);
+            } else {
+                $this->logOnce("Takt $name: " . $sysinfo->lastError);
+            }
+            $this->finishTier($name, $result, $sysinfo->lastError, $job['ts'], $job['due'], $job['started'], hrtime(true));
+            unset($jobs[$name]);
+            $changed = true;
+        }
+        return $changed;
+    }
+
+    /** Bis zum naechsten Takt warten - oder frueher, sobald eine Hintergrund-Messung fertig ist. */
+    private function waitNs(cSysinfo $sysinfo, array &$jobs, int $ns): void {
+        if ($jobs === []) {
+            $this->sleepNs($ns);
+            return;
+        }
+        $sysinfo->pump($jobs, max(0, $ns) / 1e9);
     }
 
     private function finishTier(string $name, ?array $result, ?string $error, float $ts, int $due, int $callStart, int $callEnd): void {
@@ -270,6 +365,9 @@ class cGaugePoller {
                     $point['write:' . $dev['device']]  = $dev['write_bps'];
                     $point['active:' . $dev['device']] = $dev['active_percent'];
                 }
+                break;
+            case 'wan':
+                $point['latency'] = $value['latency_ms'];
                 break;
         }
 

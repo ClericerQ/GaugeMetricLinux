@@ -324,7 +324,7 @@ body { overflow: hidden; }
 
 /* --- Netzwerk / I/O-Zeilen -------------------------------------------- */
 
-.rows { gap: .7em; }
+.rows { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .7em; }
 .row {
     flex: 1;
     min-height: 0;
@@ -357,6 +357,22 @@ body { overflow: hidden; }
 
 .active { display: inline-flex; align-items: center; gap: .5em; }
 .active .meter { width: 5em; }
+
+.row-foot .err { color: var(--crit); }
+
+/* Internet: feste Hoehe, die Schnittstellen darunter teilen sich den Rest */
+.wan {
+    display: flex;
+    flex-direction: column;
+    gap: .35em;
+    padding-bottom: .7em;
+    border-bottom: 1px solid var(--grid);
+    transition: opacity .3s;
+}
+.wan .sub-head { margin-bottom: 0; }
+.wan .v { overflow: hidden; text-overflow: ellipsis; }
+.wan .chart { flex: none; height: 4.5em; min-height: 0; }
+.wan.stale { opacity: .5; }
 
 /* --- Laufwerke (wie "Dieser PC") -------------------------------------- */
 

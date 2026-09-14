@@ -9,7 +9,10 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   Normalerweise `/usr/bin/sysinfo`, hier im Projekt; Suchreihenfolge in
   `config.json` unter `gauge.sysinfo`. Erweiterungen (Abschnittswahl, Netzwerk,
   alle Dateisysteme, Bytes als Zahl, `SYSINFO_STATE_DIR`) sind abwaertskompatibel:
-  bestehende JSON-Schluessel behalten ihr Format.
+  bestehende JSON-Schluessel behalten ihr Format. Abschnitt `wan` (oeffentliche
+  IP, Latenz per HTTP an `gauge.wan.url`) nur auf ausdruecklichen Wunsch; der
+  Poller startet ihn als eigenen Prozess, damit ein haengender Server die
+  lokalen Takte nicht aufhaelt.
 - `app/cSysinfo.php` - ruft sysinfo auf und macht aus den Strings Zahlen.
 - `app/cGaugePoller.php` - Backpoller: misst in Takten (`gauge.tiers`), schreibt
   `db/metrics.json` (tmp + rename). Start/Stopp ueber `poller.sh`.
@@ -23,6 +26,8 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   `KIOSK=off|on` uebersteuert `kiosk.mode`; `kiosk` / `kiosk-stop` einzeln.
 
 `poller.sh` liegt als Gegenstueck zu `webserver.sh` im Projekt-Root.
+`webserver.sh start` ruft `poller.sh start` mit auf (`web.start_poller`,
+`POLLER=off` uebersteuert); `webserver.sh stop` laesst den Poller laufen.
 
 # BaseFrameworkVC
 

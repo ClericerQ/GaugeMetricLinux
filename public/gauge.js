@@ -23,7 +23,14 @@
     const HEAT = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7', '#6da7ec', '#86b6ef'];
 
     // Welche Karte zeigt welchen Datenschluessel des Snapshots
-    const CARDS = { cpu: 'card-cpu', memory: 'card-mem', network: 'card-net', disk_io: 'card-io', filesystems: 'card-fs', temperatures: 'sensors' };
+    const CARDS = { cpu: 'card-cpu', memory: 'card-mem', network: 'card-net', disk_io: 'card-io', filesystems: 'card-fs', temperatures: 'sensors', wan: 'net-wan' };
+
+    // Kurzcodes aus sysinfo (Abschnitt wan) -> Anzeigetext
+    const WAN_ERRORS = {
+        dns: 'Namensauflösung fehlgeschlagen', connect: 'Server nicht erreichbar', timeout: 'Zeitüberschreitung',
+        tls: 'TLS-Fehler', 'no-ip': 'Antwort enthält keine IP-Adresse', 'no-curl': 'curl nicht installiert',
+    };
+    const wanError = (e) => WAN_ERRORS[e] || (/^http-\d+$/.test(e) ? 'HTTP ' + e.slice(5) : e);
 
     const SENSOR_WARN = 80;
     const SENSOR_CRIT = 95;
@@ -557,6 +564,23 @@
         dropMissing(state.rows.net, seen, host);
     }
 
+    function renderWan(w) {
+        $('wan-ip').textContent = w.ip || '–';
+        $('wan-ip').title = w.ip || '';
+        $('wan-latency').textContent = ok(w.latency_ms) ? num(w.latency_ms, w.latency_ms < 10 ? 1 : 0) + ' ms' : '–';
+
+        const foot = $('wan-foot');
+        foot.textContent = [w.server, !w.error && ok(w.response_ms) && 'Antwort ' + num(w.response_ms) + ' ms'].filter(Boolean).join(' · ');
+        if (w.error) foot.append(el('span', 'err', (foot.textContent ? ' · ' : '') + '⚠ ' + wanError(w.error)));
+
+        const chart = state.charts.wan || (state.charts.wan = new TimeChart($('chart-wan'), {
+            series: [{ key: 'latency', label: 'Latenz', color: C.s1, fill: true }],
+            minMax: 20,
+            format: (v) => num(v) + ' ms',
+        }));
+        feed(chart, 'wan');
+    }
+
     function renderDiskIo(list) {
         const host = $('io-list');
         const seen = new Set();
@@ -724,6 +748,9 @@
         if (d.temperatures && fresh('temperatures')) { renderSensors(d.temperatures, d.gpus); beat('sensors'); }
         if (d.memory && fresh('memory')) { renderMemory(d.memory); beat('card-mem'); }
         if (d.network && fresh('network')) { renderNetwork(d.network); beat('card-net'); }
+        // Ohne wan-Takt in config.json bleibt der Block aus, statt ewig "–" zu zeigen
+        $('net-wan').hidden = !tierOf('wan')[0];
+        if (d.wan && fresh('wan')) { renderWan(d.wan); beat('net-wan'); }
         if (d.disk_io && fresh('disk_io')) { renderDiskIo(d.disk_io); beat('card-io'); }
         if (d.filesystems && fresh('filesystems')) { renderFilesystems(d.filesystems); beat('card-fs'); }
 

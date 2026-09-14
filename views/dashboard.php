@@ -127,8 +127,19 @@ $host = htmlspecialchars((string) gethostname(), ENT_QUOTES);
                 <h2>Netzwerk</h2>
                 <span class="rate"><span class="stale-note" hidden></span><i class="pulse"></i><span class="every"></span></span>
             </header>
-            <div class="card-body rows" id="net-list">
-                <p class="empty">Warte auf Messwerte &hellip;</p>
+            <div class="card-body">
+                <div class="wan" id="net-wan" data-key="wan" hidden>
+                    <div class="sub-head"><span>Internet</span><span class="rate"><span class="stale-note" hidden></span><i class="pulse"></i><span class="every"></span></span></div>
+                    <div class="pair">
+                        <div class="val"><span class="k">&Ouml;ffentliche IP</span><span class="v" id="wan-ip">&ndash;</span></div>
+                        <div class="val"><span class="k"><i class="sw" style="background:var(--s1)"></i>Latenz</span><span class="v" id="wan-latency">&ndash;</span></div>
+                    </div>
+                    <div class="chart" id="chart-wan"></div>
+                    <div class="row-foot" id="wan-foot">&nbsp;</div>
+                </div>
+                <div class="rows" id="net-list">
+                    <p class="empty">Warte auf Messwerte &hellip;</p>
+                </div>
             </div>
         </section>
 
