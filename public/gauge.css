@@ -497,6 +497,9 @@ body { overflow: hidden; }
 .disk.crit { border-left-color: var(--crit); }
 .disk.muted { opacity: .75; }
 
+/* Randnotiz fuer Laufwerke ohne Werte: ueber die volle Breite, unauffaellig */
+.smart-silent { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .75em; }
+
 .disk .title { display: flex; justify-content: space-between; align-items: baseline; gap: .6em; }
 .disk .title span { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .badge { flex: none; padding: .05em .5em; border-radius: 999px; background: var(--grid); color: var(--ink-2); font-size: .8em; white-space: nowrap; }

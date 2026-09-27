@@ -18,7 +18,8 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   je Laufwerk, parallel, `-n standby` weckt keine Platte; Takt 5 min, eigenes
   Zeitlimit `gauge.smart.timeout`): Lebensdauer, Reservesektoren, Betriebszeit,
   Lese-/Schreibmenge und eine Hochrechnung der Restlaufzeit. Braucht root oder
-  eine sudo-Regel fuer smartctl. Anzeige in der Karte Laufwerke.
+  eine sudo-Regel fuer smartctl. Anzeige in der Karte Laufwerke; Laufwerke
+  ohne Werte (SD-Karte, USB-Bruecke, virtuell) nur als Randnotiz, ohne Kachel.
 - `/usr/bin/sysinfo` haelt `cSysinfo::install()` auf dem Stand der Projektdatei
   (`gauge.install`, Vergleich per SHA-256): beim Poller-Start und bei jedem
   Aufruf des Dashboards, das nach dem Ersetzen per 303 neu laedt.
