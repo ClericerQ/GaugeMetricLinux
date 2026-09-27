@@ -35,6 +35,9 @@
 
 * { box-sizing: border-box; }
 
+/* Schmale, gedeckte Scrollleisten: gescrollt wird auf dem Kiosk meist von selbst */
+* { scrollbar-width: thin; scrollbar-color: var(--axis) transparent; }
+
 html, body {
     margin: 0;
     background: var(--page);
@@ -125,6 +128,7 @@ body { overflow: hidden; }
 
 .card {
     position: relative;
+    container-type: inline-size;
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -328,10 +332,12 @@ body { overflow: hidden; }
 
 /* --- Netzwerk / I/O-Zeilen -------------------------------------------- */
 
-.rows { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .7em; }
+/* Zeilen teilen sich die Karte, werden aber nicht unter ihre Mindesthoehe
+   gequetscht: dann verdichtet gauge.js die Liste (.compact) und laesst sie
+   notfalls scrollen */
+.rows { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .7em; overflow-y: auto; }
 .row {
     flex: 1;
-    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: .35em;
@@ -368,6 +374,33 @@ body { overflow: hidden; }
 
 .row-foot .err { color: var(--crit); }
 
+/* Verdichtet: eine Zeile je Eintrag - Name, beide Werte, Sparkline */
+.rows.compact { gap: .35em; }
+.rows.compact .row {
+    flex: none;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) minmax(5em, 1fr);
+    align-items: center;
+    gap: .15em .8em;
+}
+.rows.compact .row + .row { padding-top: .35em; }
+.rows.compact .row-head { flex-direction: column; align-items: flex-start; gap: 0; flex-wrap: nowrap; min-width: 0; }
+.rows.compact .row-head .name,
+.rows.compact .row-head .meta { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rows.compact .row-head .meta { font-size: .72em; }
+.rows.compact .active .meter { width: 3em; }
+.rows.compact .pair { gap: 0 .6em; }
+.rows.compact .val .k { font-size: .7em; }
+.rows.compact .val .v { font-size: 1em; }
+.rows.compact .chart { flex: none; height: 2.2rem; min-height: 0; }
+.rows.compact .row-foot { display: none; }
+
+/* Schmale Karte (I/O neben der Grafikkarte): Sparkline unter Name und Werten */
+@container (max-width: 26em) {
+    .rows.compact .row { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+    .rows.compact .chart { grid-column: 1 / -1; height: 1.8rem; }
+}
+
 /* Internet: feste Hoehe, die Schnittstellen darunter teilen sich den Rest */
 .wan {
     display: flex;
@@ -389,7 +422,7 @@ body { overflow: hidden; }
 .drives {
     flex: 1;
     min-height: 0;
-    overflow: auto;
+    overflow-y: auto;
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(18em, 1fr));
     align-content: start;
@@ -422,6 +455,89 @@ body { overflow: hidden; }
 .drive.warn .state { color: var(--warn); }
 .drive.crit .state { color: var(--crit); }
 
+/* Mit SMART darunter: Dateisysteme nehmen nur, was sie brauchen, hoechstens
+   gut ein Drittel - die SMART-Kacheln haben mehr zu sagen */
+.card-body:has(> .smart:not([hidden])) > .drives { flex: 0 1 auto; max-height: 38%; min-height: 3.5em; }
+
+.drives.compact { gap: .4em; grid-template-columns: repeat(auto-fill, minmax(14em, 1fr)); }
+.drives.compact .drive { grid-template-columns: minmax(0, 1fr); padding: .4em .6em; row-gap: .15em; }
+.drives.compact .drive svg,
+.drives.compact .drive .dev { display: none; }
+.drives.compact .drive .bar { height: .6em; }
+.drives.compact .drive .free { font-size: .8em; }
+
+/* --- Datentraeger-Gesundheit (SMART) ------------------------------------ */
+
+.smart { flex: 1 1 0; min-height: 8em; display: flex; flex-direction: column; transition: opacity .3s; }
+.smart.stale { opacity: .5; }
+
+.smart-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(27em, 1fr));
+    align-content: start;
+    gap: .7em;
+}
+
+.disk {
+    display: grid;
+    grid-template-columns: 2.4em minmax(0, 1fr);
+    column-gap: .85em;
+    row-gap: .35em;
+    padding: .7em .85em;
+    background: var(--surface-2);
+    border-radius: 8px;
+    border-left: 3px solid transparent;
+}
+.disk > * { grid-column: 2; min-width: 0; }
+.disk > svg { grid-column: 1; grid-row: 1 / span 3; width: 2.4em; height: 2.4em; color: var(--ink-2); }
+.disk.warn { border-left-color: var(--warn); }
+.disk.crit { border-left-color: var(--crit); }
+.disk.muted { opacity: .75; }
+
+.disk .title { display: flex; justify-content: space-between; align-items: baseline; gap: .6em; }
+.disk .title span { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { flex: none; padding: .05em .5em; border-radius: 999px; background: var(--grid); color: var(--ink-2); font-size: .8em; white-space: nowrap; }
+.badge.good { color: var(--good); }
+.badge.crit { color: var(--ink); background: var(--crit); }
+
+.disk .meta { color: var(--muted); font-size: .8em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disk .note { color: var(--ink-2); font-size: .82em; }
+
+.gauges { display: grid; grid-template-columns: repeat(auto-fit, minmax(10em, 1fr)); gap: .3em 1.2em; }
+.gauge .g-head { display: flex; justify-content: space-between; gap: .6em; font-size: .8em; color: var(--ink-2); white-space: nowrap; }
+.gauge .g-head b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.gauge .meter { margin-top: .2em; }
+.gauge.warn .meter > i { background: var(--warn); }
+.gauge.crit .meter > i { background: var(--crit); }
+.gauge.warn .g-head b { color: var(--warn); }
+.gauge.crit .g-head b { color: var(--crit); }
+
+.disk-stats { grid-template-columns: auto minmax(0, 1fr); font-size: .82em; }
+.disk-stats dd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disk-stats dd.warn { color: var(--warn); }
+.disk-stats dd.crit { color: var(--crit); }
+
+.xfer { width: 100%; border-collapse: collapse; font-size: .75em; font-variant-numeric: tabular-nums; }
+.xfer th, .xfer td { padding: .1em 0 .1em .8em; text-align: right; white-space: nowrap; }
+.xfer th { color: var(--muted); font-weight: 500; }
+.xfer tr > th:first-child { padding-left: 0; text-align: left; }
+.xfer td:last-child { overflow: hidden; text-overflow: ellipsis; max-width: 12em; }
+.xfer-none { color: var(--muted); font-size: .75em; }
+.xfer-short { display: none; color: var(--ink-2); font-size: .8em; font-variant-numeric: tabular-nums; }
+
+/* Verdichtet: Kennzahlen bleiben, Einheitentabelle und Zaehlerdetails weichen */
+.smart-list.compact { gap: .4em; grid-template-columns: repeat(auto-fill, minmax(20em, 1fr)); }
+.smart-list.compact .disk { grid-template-columns: minmax(0, 1fr); padding: .45em .65em; row-gap: .2em; }
+.smart-list.compact .disk > * { grid-column: 1; }
+.smart-list.compact .disk > svg,
+.smart-list.compact .disk .xfer,
+.smart-list.compact .disk .xfer-none,
+.smart-list.compact .disk-stats .minor { display: none; }
+.smart-list.compact .disk .xfer-short { display: block; }
+
 /* --- Fusszeile --------------------------------------------------------- */
 
 .foot {
@@ -447,6 +563,8 @@ body { overflow: hidden; }
     }
     #card-cpu, #card-io, #card-fs { grid-column: 1 / -1; grid-row: auto; }
     #card-mem, #card-net          { grid-column: auto;   grid-row: auto; }
+    /* Karten wachsen hier mit dem Inhalt - Listen nicht zusaetzlich verdichten */
+    .rows, .drives, .smart-list { overflow: visible; }
     /* has-gpu-Regeln oben wiegen mehr als die blossen IDs: hier eigens zuruecksetzen */
     .grid.has-gpu #card-gpu, .grid.has-gpu #card-io { grid-column: auto; grid-row: auto; }
     .fact { align-items: flex-start; }
