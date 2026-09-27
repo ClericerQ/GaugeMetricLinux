@@ -89,6 +89,10 @@ get_cpu_temp() {
             label=""
             [ -r "${base}_label" ] && read -r label < "${base}_label"
             read -r val < "$t" 2>/dev/null || continue
+            # Unconnected inputs of board chips (nct67xx, it87): Intel channels on
+            # AMD boards read 0, missing SB-TSI channels read millions of degrees.
+            case "$val" in ''|*[!0-9-]*) continue ;; esac
+            [ "$val" -le 0 ] || [ "$val" -gt 150000 ] && continue
             case "$name" in
                 coretemp|k10temp|zenpower|cpu_thermal) key=${label:-$name} ;;
                 *) key="$name${label:+ $label}" ;;

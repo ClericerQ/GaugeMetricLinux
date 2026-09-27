@@ -64,7 +64,10 @@
             "sensors": { "label": "Sensoren",          "interval_ms": 2000,  "sections": ["temp"],   "history": 0 },
             "gpu":     { "label": "Grafikkarte",       "interval_ms": 1000,  "sections": ["gpu"],    "history": 120 },
             "diskio":  { "label": "Datenträger-I/O","interval_ms": 2000,  "sections": ["diskio"], "history": 90 },
-            "storage": { "label": "Laufwerke",         "interval_ms": 10000, "sections": ["disk"],   "history": 0 },
+            "sensors": {
+            "exclude": ["nct6793 SYSTIN", "nct6793 AUXTIN[123]"]
+        },
+        "storage": { "label": "Laufwerke",         "interval_ms": 10000, "sections": ["disk"],   "history": 0 },
             "system":  { "label": "System",            "interval_ms": 5000,  "sections": ["system"], "history": 0 },
             "wan":     { "label": "Internet",          "interval_ms": 10000, "sections": ["wan"],    "history": 90 },
             "smart":   { "label": "SMART",             "interval_ms": 300000, "sections": ["smart"], "history": 0 }
