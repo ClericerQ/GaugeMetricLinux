@@ -347,7 +347,13 @@
         charts: {},
         rows: { net: new Map(), io: new Map(), gpu: new Map() },
         link: null,
+        failStreak: 0,
     };
+
+    // Ein einzelner haengender Poll (Tunnel-Jitter, kurzer Verbindungsaufbau)
+    // darf die Anzeige nicht sofort auf "nicht erreichbar" springen lassen -
+    // erst mehrere Fehlschlaege in Folge sind ein echter Ausfall.
+    const FAIL_THRESHOLD = 3;
 
     const serverNow = () => Date.now() / 1000 + state.offset;
 
@@ -1095,14 +1101,17 @@
             const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
             const body = await res.json();
             if (res.status === 503) {
+                state.failStreak = 0;
                 setLink('warn', 'Warte auf Poller …');
             } else if (!res.ok) {
                 throw new Error('HTTP ' + res.status);
             } else {
+                state.failStreak = 0;
                 apply(body);
             }
         } catch (e) {
-            setLink('err', 'Server nicht erreichbar');
+            state.failStreak++;
+            if (state.failStreak >= FAIL_THRESHOLD) setLink('err', 'Server nicht erreichbar');
             checkStale();
         } finally {
             clearTimeout(timer);
