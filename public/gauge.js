@@ -858,8 +858,10 @@
         return table;
     }
 
+    const smartHasData = (d) => ok(d.power_on_hours) || d.health !== '';
+
     function smartTile(d, design) {
-        const hasData = ok(d.power_on_hours) || d.health !== '';
+        const hasData = smartHasData(d);
         const tile = el('div', 'disk');
         tile.innerHTML = d.kind === 'hdd' ? DRIVE_ICON : SSD_ICON;
 
@@ -965,9 +967,28 @@
         host.textContent = '';
         const list = s.devices || [];
 
+        // Laufwerke ohne Werte (SD-Karte, USB-Bruecke, virtuell) bekommen keine
+        // eigene Kachel - eine Randnotiz genuegt, der Platz gehoert den lesbaren
+        const shown = list.filter(smartHasData);
+        const silent = list.filter((d) => !smartHasData(d));
+
         if (s.error) host.append(el('p', 'empty', '⚠ ' + smartError(s.error)));
         else if (!list.length) host.append(el('p', 'empty', 'Keine Laufwerke gefunden'));
-        for (const d of list) host.append(smartTile(d, s.design_hours));
+        else if (!shown.length) host.append(el('p', 'empty', 'Kein Laufwerk liefert SMART-Werte'));
+        for (const d of shown) host.append(smartTile(d, s.design_hours));
+
+        if (silent.length) {
+            // Nach Grund gebuendelt: "mmcblk0, sdc – Kein SMART (...)"
+            const groups = new Map();
+            for (const d of silent) {
+                const why = d.state === 'standby' ? 'im Standby' : smartError(d.error || 'no-data');
+                groups.set(why, [...(groups.get(why) || []), d.device]);
+            }
+            const parts = [...groups].map(([why, devs]) => devs.join(', ') + ' – ' + why);
+            const note = el('p', 'smart-silent', 'Ohne SMART-Werte: ' + parts.join(' · '));
+            note.title = silent.map((d) => [d.device, d.model].filter(Boolean).join(' · ')).join('\n');
+            host.append(note);
+        }
 
         // Kacheln wechseln zwischen Daten und Hinweis - jedes Mal neu messen
         fit(host);
