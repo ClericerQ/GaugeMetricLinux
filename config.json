@@ -1,6 +1,6 @@
 {
     "info": {
-        "version": "1.2",
+        "version": "1.3",
         "name": "GaugeMetricLinux"
     },
     "database": {
@@ -47,6 +47,10 @@
     },
     "gauge": {
         "sysinfo": ["{dir}sysinfo", "/usr/bin/sysinfo"],
+        "install": {
+            "source": "{dir}sysinfo",
+            "target": "/usr/bin/sysinfo"
+        },
         "state_dir": "{dir}db/sysinfo/",
         "snapshot": "{dir}db/metrics.json",
         "call_timeout": 5,
@@ -62,11 +66,18 @@
             "diskio":  { "label": "Datenträger-I/O","interval_ms": 2000,  "sections": ["diskio"], "history": 90 },
             "storage": { "label": "Laufwerke",         "interval_ms": 10000, "sections": ["disk"],   "history": 0 },
             "system":  { "label": "System",            "interval_ms": 5000,  "sections": ["system"], "history": 0 },
-            "wan":     { "label": "Internet",          "interval_ms": 10000, "sections": ["wan"],    "history": 90 }
+            "wan":     { "label": "Internet",          "interval_ms": 10000, "sections": ["wan"],    "history": 90 },
+            "smart":   { "label": "SMART",             "interval_ms": 300000, "sections": ["smart"], "history": 0 }
         },
         "wan": {
             "url": "https://dirin.eu/wanip/index.php",
             "timeout": 3
+        },
+        "smart": {
+            "timeout": 20,
+            "design_hours": 43800,
+            "devices": [],
+            "exclude": []
         },
         "network": {
             "exclude": ["lo", "veth*", "docker*", "br-*", "virbr*", "tap*", "fwbr*", "fwpr*", "fwln*"],

@@ -25,6 +25,7 @@ class cGaugePoller {
         'diskio' => 'disk_io',
         'net'    => 'network',
         'wan'    => 'wan',
+        'smart'  => 'smart',
     ];
 
     // Abschnitte, deren Werte Raten aus zwei Zaehlerstaenden sind.
@@ -33,8 +34,9 @@ class cGaugePoller {
     // Abschnitte, die unberechenbar lange brauchen koennen. Ihr Takt laeuft als
     // eigener Prozess, damit die CPU trotzdem im Takt weitermisst: wan wartet auf
     // einen fremden Server, nvidia-smi ohne Persistence Mode laedt bei jedem
-    // Aufruf den Treiber neu und braucht dann gern eine Sekunde und mehr.
-    private const BACKGROUND_SECTIONS = ['wan', 'gpu'];
+    // Aufruf den Treiber neu und braucht dann gern eine Sekunde und mehr,
+    // smartctl wartet je nach Controller mehrere Sekunden auf die Laufwerke.
+    private const BACKGROUND_SECTIONS = ['wan', 'gpu', 'smart'];
 
     private bool    $stop       = false;
     private array   $cfg        = [];
@@ -63,6 +65,16 @@ class cGaugePoller {
         }
 
         $sysinfo = $GLOBALS['cSysinfo'] ?? new cSysinfo();
+
+        // Laeuft meist als root und kann /usr/bin/sysinfo daher auch dann
+        // nachziehen, wenn der Webserver es nicht darf.
+        $installed = $sysinfo->install();
+        if ($installed === 'installed' || $installed === 'updated') {
+            $this->log("sysinfo nach gauge.install.target kopiert ($installed)");
+        } elseif ($installed === 'failed') {
+            $this->log((string) $sysinfo->lastError);
+        }
+
         $script  = $sysinfo->script();
         if ($script === null) {
             return $this->fail((string) $sysinfo->lastError);
@@ -336,7 +348,37 @@ class cGaugePoller {
             return array_values(array_filter($value, fn(array $fs): bool => !$this->matches($fs['mount'], $exclude)));
         }
 
+        if ($key === 'smart') {
+            return $this->filterSmart($value);
+        }
+
         return $value;
+    }
+
+    /**
+     * Ein Laufwerk im Standby weckt sysinfo absichtlich nicht auf und liefert
+     * dann keine Werte. Statt die Kachel leer zu raeumen, bleiben die Werte der
+     * letzten Messung stehen - SMART-Zaehler aendern sich im Schlaf ohnehin nicht.
+     */
+    private function filterSmart(array $smart): array {
+        $exclude  = (array) ($this->cfg['smart']['exclude'] ?? []);
+        $previous = [];
+        foreach ((array) ($this->data['smart']['devices'] ?? []) as $dev) {
+            $previous[$dev['device']] = $dev;
+        }
+
+        $devices = [];
+        foreach ($smart['devices'] as $dev) {
+            if ($this->matches($dev['device'], $exclude)) continue;
+
+            $old = $previous[$dev['device']] ?? null;
+            if ($dev['state'] === 'standby' && $old !== null && $old['power_on_hours'] !== null) {
+                $dev = ['state' => 'standby', 'error' => null] + $old;
+            }
+            $devices[] = $dev;
+        }
+        $smart['devices'] = $devices;
+        return $smart;
     }
 
     private function matches(string $name, array $patterns): bool {
