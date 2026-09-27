@@ -25,14 +25,18 @@ class cGaugePoller {
         'diskio' => 'disk_io',
         'net'    => 'network',
         'wan'    => 'wan',
+        'smart'  => 'smart',
     ];
 
     // Abschnitte, deren Werte Raten aus zwei Zaehlerstaenden sind.
     private const RATE_SECTIONS = ['cpu', 'diskio', 'net'];
 
-    // Abschnitte, die auf einen fremden Server warten. Ihr Takt laeuft als eigener
-    // Prozess: haengt der Server bis zum Timeout, misst die CPU trotzdem weiter.
-    private const BACKGROUND_SECTIONS = ['wan'];
+    // Abschnitte, die unberechenbar lange brauchen koennen. Ihr Takt laeuft als
+    // eigener Prozess, damit die CPU trotzdem im Takt weitermisst: wan wartet auf
+    // einen fremden Server, nvidia-smi ohne Persistence Mode laedt bei jedem
+    // Aufruf den Treiber neu und braucht dann gern eine Sekunde und mehr,
+    // smartctl wartet je nach Controller mehrere Sekunden auf die Laufwerke.
+    private const BACKGROUND_SECTIONS = ['wan', 'gpu', 'smart'];
 
     private bool    $stop       = false;
     private array   $cfg        = [];
@@ -61,6 +65,16 @@ class cGaugePoller {
         }
 
         $sysinfo = $GLOBALS['cSysinfo'] ?? new cSysinfo();
+
+        // Laeuft meist als root und kann /usr/bin/sysinfo daher auch dann
+        // nachziehen, wenn der Webserver es nicht darf.
+        $installed = $sysinfo->install();
+        if ($installed === 'installed' || $installed === 'updated') {
+            $this->log("sysinfo nach gauge.install.target kopiert ($installed)");
+        } elseif ($installed === 'failed') {
+            $this->log((string) $sysinfo->lastError);
+        }
+
         $script  = $sysinfo->script();
         if ($script === null) {
             return $this->fail((string) $sysinfo->lastError);
@@ -184,12 +198,14 @@ class cGaugePoller {
                 return $this->fail("cGaugePoller: Takt '$name' braucht interval_ms >= 100");
             }
 
-            // Gemischt ginge nicht gut: ein zweiter sysinfo-Prozess mit cpu oder net
-            // wuerde neben dem Haupttakt dieselben Zaehlerstaende fortschreiben.
+            // Ein Hintergrund-Takt nimmt alle seine Abschnitte mit in den eigenen
+            // Prozess. Fuer temp o. ae. ist das egal - aber ein zweiter Prozess mit
+            // cpu oder net wuerde neben dem Haupttakt dieselben Zaehlerstaende fortschreiben.
             $background = array_intersect($sections, self::BACKGROUND_SECTIONS) !== [];
-            if ($background && array_diff($sections, self::BACKGROUND_SECTIONS) !== []) {
-                return $this->fail("cGaugePoller: Takt '$name' mischt " . implode(', ', self::BACKGROUND_SECTIONS)
-                    . ' mit lokalen Abschnitten - bitte in einen eigenen Takt');
+            $rates      = array_intersect($sections, self::RATE_SECTIONS);
+            if ($background && $rates !== []) {
+                return $this->fail("cGaugePoller: Takt '$name' mischt " . implode(', ', array_intersect($sections, self::BACKGROUND_SECTIONS))
+                    . ' mit ' . implode(', ', $rates) . ' - bitte in einen eigenen Takt');
             }
 
             $this->tiers[(string) $name] = [
@@ -332,7 +348,37 @@ class cGaugePoller {
             return array_values(array_filter($value, fn(array $fs): bool => !$this->matches($fs['mount'], $exclude)));
         }
 
+        if ($key === 'smart') {
+            return $this->filterSmart($value);
+        }
+
         return $value;
+    }
+
+    /**
+     * Ein Laufwerk im Standby weckt sysinfo absichtlich nicht auf und liefert
+     * dann keine Werte. Statt die Kachel leer zu raeumen, bleiben die Werte der
+     * letzten Messung stehen - SMART-Zaehler aendern sich im Schlaf ohnehin nicht.
+     */
+    private function filterSmart(array $smart): array {
+        $exclude  = (array) ($this->cfg['smart']['exclude'] ?? []);
+        $previous = [];
+        foreach ((array) ($this->data['smart']['devices'] ?? []) as $dev) {
+            $previous[$dev['device']] = $dev;
+        }
+
+        $devices = [];
+        foreach ($smart['devices'] as $dev) {
+            if ($this->matches($dev['device'], $exclude)) continue;
+
+            $old = $previous[$dev['device']] ?? null;
+            if ($dev['state'] === 'standby' && $old !== null && $old['power_on_hours'] !== null) {
+                $dev = ['state' => 'standby', 'error' => null] + $old;
+            }
+            $devices[] = $dev;
+        }
+        $smart['devices'] = $devices;
+        return $smart;
     }
 
     private function matches(string $name, array $patterns): bool {
@@ -364,6 +410,12 @@ class cGaugePoller {
                     $point['read:' . $dev['device']]   = $dev['read_bps'];
                     $point['write:' . $dev['device']]  = $dev['write_bps'];
                     $point['active:' . $dev['device']] = $dev['active_percent'];
+                }
+                break;
+            case 'gpus':
+                foreach ($value as $gpu) {
+                    $point['util:' . $gpu['id']] = $gpu['percent'];
+                    $point['mem:' . $gpu['id']]  = $gpu['memory_percent'] ?? null;
                 }
                 break;
             case 'wan':

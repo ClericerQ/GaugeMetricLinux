@@ -3,14 +3,29 @@
  * Kiosk-Dashboard - eine Seite, alle Werte auf einen Blick.
  *
  * Die Karten stehen in der Reihenfolge ihrer Abtastrate: CPU, Arbeitsspeicher,
- * Netzwerk, Datentraeger-I/O, Laufwerke. Die Werte selbst holt gauge.js ueber
- * /api/metrics; hier wird nur das Geruest und die Konfiguration ausgeliefert.
+ * Netzwerk, Grafikkarte, Datentraeger-I/O, Laufwerke (mit SMART darunter). Die Grafikkarte blendet
+ * gauge.js erst ein, wenn nvidia-smi eine meldet - ohne GPU bleibt das Raster
+ * wie gehabt. Die Werte selbst holt gauge.js ueber /api/metrics; hier wird nur
+ * das Geruest und die Konfiguration ausgeliefert.
  *
  * @var cRoute $cRoute
  * @var string $dir
  */
 
 $gauge = CONFIG['gauge'] ?? [];
+
+// Fehlt /usr/bin/sysinfo oder weicht es von der Projektversion ab, wird es
+// ersetzt und die Seite neu geladen: so sieht der Kiosk nie Werte eines
+// sysinfo, dessen Felder nicht zu diesem gauge.js passen. install() prueft
+// nach dem Kopieren nach - ein zweiter Durchlauf endet in 'current' oder
+// 'failed', nie in einer Umleitungsschleife.
+/** @var cSysinfo $cSysinfo */
+$install = $cSysinfo->install();
+if ($install === 'installed' || $install === 'updated') {
+    $cRoute->status(303)->send('Location', $cRoute->uri())->send('Cache-Control', 'no-store');
+    return;
+}
+$installSource = (string) ($gauge['install']['source'] ?? '');
 
 $tiers = [];
 foreach ((array) ($gauge['tiers'] ?? []) as $name => $tier) {
@@ -34,6 +49,11 @@ $ui = [
     // einem halben Takt auf dem Schirm, egal wie Poller und Browser zueinander liegen.
     'poll_ms' => max(100, intdiv(min($intervals), 2)),
     'tiers'   => $tiers,
+    'sysinfo' => [
+        'status'  => $install,
+        'error'   => $install === 'failed' ? (string) $cSysinfo->lastError : null,
+        'version' => is_file($installSource) ? substr((string) hash_file('sha256', $installSource), 0, 8) : null,
+    ],
     'storage' => [
         'warn_percent'     => (float) ($gauge['storage']['warn_percent'] ?? 80),
         'critical_percent' => (float) ($gauge['storage']['critical_percent'] ?? 90),
@@ -68,7 +88,7 @@ $host = htmlspecialchars((string) gethostname(), ENT_QUOTES);
         </div>
     </header>
 
-    <main class="grid">
+    <main class="grid" id="grid">
 
         <section class="card" id="card-cpu" data-key="cpu">
             <header class="card-head">
@@ -143,6 +163,16 @@ $host = htmlspecialchars((string) gethostname(), ENT_QUOTES);
             </div>
         </section>
 
+        <section class="card" id="card-gpu" data-key="gpus" hidden>
+            <header class="card-head">
+                <h2>Grafikkarte</h2>
+                <span class="rate"><span class="stale-note" hidden></span><i class="pulse"></i><span class="every"></span></span>
+            </header>
+            <div class="card-body rows" id="gpu-list">
+                <p class="empty">Warte auf Messwerte &hellip;</p>
+            </div>
+        </section>
+
         <section class="card" id="card-io" data-key="disk_io">
             <header class="card-head">
                 <h2>Datentr&auml;ger-I/O</h2>
@@ -161,6 +191,10 @@ $host = htmlspecialchars((string) gethostname(), ENT_QUOTES);
             <div class="card-body">
                 <div class="fs-summary" id="fs-summary">&nbsp;</div>
                 <div class="drives" id="fs-list"></div>
+                <div class="smart" id="fs-smart" data-key="smart" hidden>
+                    <div class="sub-head"><span>Datentr&auml;ger-Gesundheit (SMART)</span><span class="rate"><span class="stale-note" hidden></span><i class="pulse"></i><span class="every"></span></span></div>
+                    <div class="smart-list" id="smart-list"><p class="empty">Warte auf Messwerte &hellip;</p></div>
+                </div>
             </div>
         </section>
 

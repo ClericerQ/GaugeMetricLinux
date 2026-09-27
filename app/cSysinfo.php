@@ -13,13 +13,18 @@ class cSysinfo {
     public ?string $lastError = null;
 
     // Mehr kennt sysinfo nicht - ein unbekannter Abschnitt bricht dort mit Code 2 ab.
-    public const SECTIONS = ['system', 'cpu', 'temp', 'mem', 'disk', 'gpu', 'diskio', 'net', 'wan'];
+    public const SECTIONS = ['system', 'cpu', 'temp', 'mem', 'disk', 'gpu', 'diskio', 'net', 'wan', 'smart'];
 
     private array   $candidates;
     private ?string $stateDir;
     private int     $timeout;
     private ?string $wanUrl;
     private int     $wanTimeout;
+    private int     $smartTimeout;
+    private int     $smartDesignHours;
+    private array   $smartDevices;
+    private ?string $installSource;
+    private ?string $installTarget;
 
     public function __construct(?array $options = null) {
         $cfg = $options ?? (defined('CONFIG') ? (CONFIG['gauge'] ?? []) : []);
@@ -36,6 +41,72 @@ class cSysinfo {
         // Unter call_timeout: sonst wuerde sysinfo abgeschossen, bevor curl
         // selbst "timeout" meldet, und der Takt stuende als Messfehler da.
         $this->wanTimeout = max(1, min((int) ($cfg['wan']['timeout'] ?? 3), $this->timeout - 1));
+
+        // smartctl fragt die Laufwerke parallel ab, braucht je Laufwerk aber
+        // gern eine Sekunde und mehr (USB-Bruecken, SAS-Controller) - call_timeout
+        // ist fuer die schnellen Takte bemessen und reicht dafuer nicht.
+        $this->smartTimeout     = max($this->timeout, (int) ($cfg['smart']['timeout'] ?? 20));
+        $this->smartDesignHours = max(0, (int) ($cfg['smart']['design_hours'] ?? 43800));
+        $this->smartDevices     = array_values(array_filter(array_map('strval', (array) ($cfg['smart']['devices'] ?? []))));
+
+        $source = trim((string) ($cfg['install']['source'] ?? ''));
+        $target = trim((string) ($cfg['install']['target'] ?? ''));
+        $this->installSource = $source === '' ? null : $source;
+        $this->installTarget = $target === '' ? null : $target;
+    }
+
+    /**
+     * Haelt das systemweite sysinfo (gauge.install.target, /usr/bin/sysinfo)
+     * auf dem Stand der Projektversion. Verglichen wird der Inhalt, nicht das
+     * Datum: eine aeltere Kopie von Hand oder aus einem Paket ist genauso
+     * "falsch" wie eine fehlende - das Dashboard erwartet die Abschnitte und
+     * Felder genau dieser Version.
+     *
+     * Rueckgabe: 'current' (nichts zu tun), 'installed', 'updated',
+     * 'skipped' (nicht konfiguriert) oder 'failed' (Grund in lastError).
+     */
+    public function install(): string {
+        $source = $this->installSource;
+        $target = $this->installTarget;
+        if ($source === null || $target === null) return 'skipped';
+
+        if (!is_file($source) || !is_readable($source)) {
+            $this->lastError = "cSysinfo: Vorlage $source fehlt";
+            return 'failed';
+        }
+        if (realpath($source) === realpath($target)) return 'current';
+
+        $want   = hash_file('sha256', $source);
+        $exists = is_file($target);
+        if ($exists && is_executable($target) && hash_file('sha256', $target) === $want) {
+            return 'current';
+        }
+
+        // tmp + rename im Zielverzeichnis: ein gleichzeitig laufendes sysinfo
+        // liest nie eine halb geschriebene Datei, und ein fehlgeschlagenes
+        // Kopieren laesst die alte Version stehen.
+        $dir = dirname($target);
+        $tmp = $dir . '/.' . basename($target) . '.' . getmypid() . '.tmp';
+        if (!is_writable($dir) || !@copy($source, $tmp)) {
+            $this->lastError = "cSysinfo: $target nicht schreibbar - einmal als root: install -m 755 $source $target";
+            return 'failed';
+        }
+        if (!@chmod($tmp, 0755) || !@rename($tmp, $target)) {
+            @unlink($tmp);
+            $this->lastError = "cSysinfo: $target liess sich nicht ersetzen";
+            return 'failed';
+        }
+
+        clearstatcache(true, $target);
+        // Nachpruefen verhindert eine Endlosschleife aus Kopieren und Neuladen,
+        // falls etwas (Overlay, Paketmanager-Hook) die Datei gleich wieder aendert.
+        if (hash_file('sha256', $target) !== $want) {
+            $this->lastError = "cSysinfo: $target weicht nach dem Kopieren weiter ab";
+            return 'failed';
+        }
+
+        $this->lastError = null;
+        return $exists ? 'updated' : 'installed';
     }
 
     /** Erstes vorhandene sysinfo aus gauge.sysinfo. */
@@ -98,6 +169,17 @@ class cSysinfo {
         }
         $env['SYSINFO_WAN_TIMEOUT'] = (string) $this->wanTimeout;
 
+        if (in_array('smart', $sections, true)) {
+            // Je Laufwerk etwas weniger als der ganze Aufruf: ein haengendes
+            // Laufwerk meldet sich als "timeout", statt alle mitzureissen.
+            $env['SYSINFO_SMART_TIMEOUT']      = (string) max(1, $this->smartTimeout - 2);
+            $env['SYSINFO_SMART_DESIGN_HOURS'] = (string) $this->smartDesignHours;
+            if ($this->smartDevices !== []) {
+                $env['SYSINFO_SMART_DEVICES'] = implode(' ', $this->smartDevices);
+            }
+        }
+        $timeout = in_array('smart', $sections, true) ? $this->smartTimeout : $this->timeout;
+
         $proc = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
         if (!is_resource($proc)) {
             $this->lastError = 'cSysinfo: sysinfo liess sich nicht starten';
@@ -110,7 +192,8 @@ class cSysinfo {
         return [
             'proc'      => $proc,
             'pipes'     => $pipes,
-            'deadline'  => microtime(true) + $this->timeout,
+            'deadline'  => microtime(true) + $timeout,
+            'timeout'   => $timeout,
             'out'       => '',
             'err'       => '',
             'done'      => false,
@@ -180,7 +263,7 @@ class cSysinfo {
         $code = proc_close($job['proc']);
 
         if ($timedOut) {
-            $this->lastError = "cSysinfo: sysinfo nach {$this->timeout} s abgebrochen";
+            $this->lastError = 'cSysinfo: sysinfo nach ' . ($job['timeout'] ?? $this->timeout) . ' s abgebrochen';
             return null;
         }
 
@@ -259,12 +342,24 @@ class cSysinfo {
         if (isset($raw['gpus'])) {
             $gpus = [];
             foreach ((array) $raw['gpus'] as $gpu) {
+                $memUsed  = isset($gpu['memory_used_bytes']) ? (int) $gpu['memory_used_bytes'] : null;
+                $memTotal = isset($gpu['memory_total_bytes']) ? (int) $gpu['memory_total_bytes'] : null;
+
                 $gpus[] = [
-                    'id'      => (int) ($gpu['id'] ?? count($gpus)),
-                    'name'    => (string) ($gpu['name'] ?? 'GPU'),
-                    'celsius' => $this->number((string) ($gpu['temp'] ?? '')),
-                    'watt'    => $this->number((string) ($gpu['power'] ?? '')),
-                    'percent' => $this->number((string) ($gpu['utilization'] ?? '')),
+                    'id'           => (int) ($gpu['id'] ?? count($gpus)),
+                    'name'         => (string) ($gpu['name'] ?? 'GPU'),
+                    'celsius'      => $this->number((string) ($gpu['temp'] ?? '')),
+                    'watt'         => $this->number((string) ($gpu['power'] ?? '')),
+                    'watt_limit'   => isset($gpu['power_limit_w']) ? (float) $gpu['power_limit_w'] : null,
+                    'percent'      => $this->number((string) ($gpu['utilization'] ?? '')),
+                    'memory_used'  => $memUsed,
+                    'memory_total' => $memTotal,
+                    // Unified Memory (z. B. DGX Spark) meldet keinen eigenen VRAM:
+                    // null statt 0 %, sonst saehe es aus wie ein leerer Speicher.
+                    'memory_percent' => ($memUsed !== null && $memTotal > 0) ? round($memUsed / $memTotal * 100, 1) : null,
+                    'fan_percent'  => isset($gpu['fan_percent']) ? (float) $gpu['fan_percent'] : null,
+                    'pstate'       => (string) ($gpu['pstate'] ?? ''),
+                    'driver'       => (string) ($gpu['driver'] ?? ''),
                 ];
             }
             $out['gpus'] = $gpus;
@@ -317,6 +412,10 @@ class cSysinfo {
             ];
         }
 
+        if (isset($raw['smart']) && is_array($raw['smart'])) {
+            $out['smart'] = $this->smart($raw['smart']);
+        }
+
         return $out;
     }
 
@@ -348,6 +447,74 @@ class cSysinfo {
             'free'       => ($total !== null && $used !== null) ? max(0, $total - $used - $cache) : null,
             'swap_total' => isset($m['swap_total_bytes']) ? (int) $m['swap_total_bytes'] : null,
             'swap_used'  => isset($m['swap_used_bytes']) ? (int) $m['swap_used_bytes'] : null,
+        ];
+    }
+
+    private function smart(array $s): array {
+        $int = static fn(array $d, string $k): ?int => isset($d[$k]) && is_numeric($d[$k]) ? (int) $d[$k] : null;
+
+        $devices = [];
+        foreach ((array) ($s['devices'] ?? []) as $d) {
+            $health = strtoupper(trim((string) ($d['health'] ?? '')));
+            $hours  = $int($d, 'power_on_hours');
+            $cycles = $int($d, 'power_cycles');
+            $used   = isset($d['life_used_percent']) ? (float) $d['life_used_percent'] : null;
+
+            $devices[] = [
+                'device'       => (string) ($d['device'] ?? '?'),
+                'kind'         => (string) ($d['kind'] ?? ''),
+                'model'        => (string) ($d['model'] ?? ''),
+                'serial'       => (string) ($d['serial'] ?? ''),
+                'firmware'     => (string) ($d['firmware'] ?? ''),
+                'capacity'     => $int($d, 'capacity_bytes'),
+                'rpm'          => $int($d, 'rpm'),
+                'health'       => $health,
+                // PASSED (ATA/NVMe) bzw. OK (SCSI); leer = Laufwerk hat nichts gesagt
+                'healthy'      => $health === '' ? null : in_array($health, ['PASSED', 'OK'], true),
+                'celsius'      => isset($d['temp_c']) ? (float) $d['temp_c'] : null,
+                'power_on_hours' => $hours,
+                'power_cycles' => $cycles,
+                'hours_per_cycle' => ($hours !== null && $cycles > 0) ? round($hours / $cycles, 1) : null,
+                'read'         => $this->volume($int($d, 'read_bytes')),
+                'written'      => $this->volume($int($d, 'written_bytes')),
+                'life_used'    => $used,
+                'life_left'    => $used === null ? null : max(0.0, 100 - $used),
+                'spare'        => isset($d['spare_percent']) ? (float) $d['spare_percent'] : null,
+                'spare_threshold' => isset($d['spare_threshold_percent']) ? (float) $d['spare_threshold_percent'] : null,
+                'reallocated'  => $int($d, 'reallocated_sectors'),
+                'pending'      => $int($d, 'pending_sectors'),
+                'uncorrectable' => $int($d, 'uncorrectable_sectors'),
+                'unused_reserve_blocks' => $int($d, 'unused_reserve_blocks'),
+                'media_errors' => $int($d, 'media_errors'),
+                'unsafe_shutdowns' => $int($d, 'unsafe_shutdowns'),
+                'remaining_hours' => $int($d, 'life_remaining_hours'),
+                'remaining_basis' => (string) ($d['life_basis'] ?? ''),
+                'state'        => (string) ($d['state'] ?? ''),
+                'error'        => ($e = trim((string) ($d['error'] ?? ''))) === '' ? null : $e,
+            ];
+        }
+
+        $error = trim((string) ($s['error'] ?? ''));
+        return [
+            'smartctl'     => (string) ($s['smartctl'] ?? ''),
+            'error'        => $error === '' ? null : $error,
+            'design_hours' => $int($s, 'design_hours'),
+            'devices'      => $devices,
+        ];
+    }
+
+    /**
+     * Datenmenge in allen Einheiten, die das Dashboard zeigt. Dezimal wie die
+     * Hersteller: eine "1 TB"-SSD mit 600 TBW rechnet in 10^12 Byte.
+     */
+    private function volume(?int $bytes): ?array {
+        if ($bytes === null) return null;
+        return [
+            'bytes' => $bytes,
+            'bit'   => $bytes * 8,
+            'mbit'  => round($bytes * 8 / 1e6, 1),
+            'gb'    => round($bytes / 1e9, 2),
+            'tb'    => round($bytes / 1e12, 3),
         ];
     }
 

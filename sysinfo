@@ -5,11 +5,18 @@
 #   sysinfo json                     all local sections as JSON
 #   sysinfo json cpu mem net ...     only the given sections
 #
-# Sections: system cpu temp mem disk gpu diskio net wan
+# Sections: system cpu temp mem disk gpu diskio net wan smart
 #
 # "wan" (public IP and latency) sends a request to the internet and is only
 # included when asked for by name - a plain "sysinfo json" stays offline.
 # SYSINFO_WAN_URL overrides the server, SYSINFO_WAN_TIMEOUT its timeout (s).
+#
+# "smart" runs smartctl -a on every physical drive (needs root or a sudo rule
+# for smartctl). Sleeping hard disks are not woken up (-n standby). Like wan it
+# is only included when asked for by name: a call can take seconds.
+# SYSINFO_SMART_DEVICES="sda nvme0n1" limits it to these drives,
+# SYSINFO_SMART_TIMEOUT the time per drive (s), SYSINFO_SMART_DESIGN_HOURS
+# the assumed service life of a hard disk for the lifetime estimate.
 #
 # SYSINFO_STATE_DIR=/some/dir keeps the counter state for the rate values
 # (cpu, diskio, net) in that directory. A background poller sets it so that
@@ -18,6 +25,11 @@
 
 WAN_URL="${SYSINFO_WAN_URL:-https://dirin.eu/wanip/index.php}"
 WAN_TIMEOUT="${SYSINFO_WAN_TIMEOUT:-3}"
+
+SMART_DEVICES="${SYSINFO_SMART_DEVICES:-}"
+SMART_TIMEOUT="${SYSINFO_SMART_TIMEOUT:-10}"
+# 5 years of continuous operation - the usual warranty of NAS and server disks
+SMART_DESIGN_HOURS="${SYSINFO_SMART_DESIGN_HOURS:-43800}"
 
 STATE_DIR="${SYSINFO_STATE_DIR:-}"
 if [ -n "$STATE_DIR" ]; then
@@ -124,8 +136,254 @@ get_filesystems() {
 }
 
 get_gpu_info() {
-    # Returns: Name|Temp|Power|Util
-    nvidia-smi --query-gpu=name,temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf "%s|%sC|%sW|%s%%\n", $1, $2, $3, $4}'
+    # Returns: name|temp|power|util|index|mem_used_bytes|mem_total_bytes|power_limit_w|fan_percent|pstate|driver
+    # The first four keep their old form ("53C", "120.5W", "30%"). The rest are
+    # plain numbers, empty where the card answers [N/A] - e.g. no own VRAM on
+    # unified memory systems, no fan on passively cooled cards.
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    # name last: it is the only field that could ever contain a comma.
+    # timeout: a wedged driver makes nvidia-smi hang instead of failing.
+    LC_ALL=C timeout 3 nvidia-smi \
+        --query-gpu=index,temperature.gpu,power.draw,utilization.gpu,memory.used,memory.total,power.limit,fan.speed,pstate,driver_version,name \
+        --format=csv,noheader,nounits 2>/dev/null |
+        awk -F', *' '
+        function n(v) { return v ~ /^[0-9]+(\.[0-9]+)?$/ ? v : "" }
+        function mib(v) { return n(v) == "" ? "" : sprintf("%.0f", v * 1048576) }
+        # Driver errors ("NVIDIA-SMI has failed ...") also go to stdout
+        NF >= 11 && $1 ~ /^[0-9]+$/ {
+            name = $11; for (i = 12; i <= NF; i++) name = name ", " $i;
+            printf "%s|%sC|%sW|%s%%|%s|%s|%s|%s|%s|%s|%s\n", name, $2, $3, $4, $1,
+                mib($5), mib($6), n($7), n($8), $9, $10
+        }'
+}
+
+smart_devices() {
+    # Physical drives: block devices backed by real hardware. Partitions,
+    # device mapper, md, loop, ram and optical drives have no SMART data.
+    if [ -n "$SMART_DEVICES" ]; then
+        printf '%s\n' $SMART_DEVICES
+        return
+    fi
+    local d n rem
+    for d in /sys/block/*; do
+        n=${d##*/}
+        [ -e "$d/device" ] || continue
+        case "$n" in loop*|ram*|zram*|dm-*|md*|nbd*|rbd*|sr*|fd*) continue ;; esac
+        # Hidden NVMe multipath paths (nvme0c0n1) - the namespace nvme0n1 is listed anyway
+        [[ "$n" =~ ^nvme[0-9]+c[0-9]+n ]] && continue
+        # Card readers and USB sticks: removable, no SMART
+        rem=0
+        [ -r "$d/removable" ] && read -r rem < "$d/removable"
+        [ "$rem" == "1" ] && continue
+        echo "$n"
+    done
+}
+
+smart_parse() {
+    # Reads the output of "smartctl -a" and prints one line:
+    # device|kind|model|serial|firmware|capacity_bytes|rpm|health|temp_c|
+    # power_on_hours|power_cycles|read_bytes|written_bytes|life_used_percent|
+    # spare_percent|spare_threshold|reallocated|pending|uncorrectable|
+    # unused_reserve_blocks|media_errors|unsafe_shutdowns|remaining_hours|basis|state|error
+    #
+    # Text instead of "smartctl -j": JSON needs smartmontools 7 and a parser
+    # (jq) that is not installed everywhere; the text labels have been stable
+    # for many versions. Missing values stay empty.
+    awk -v dev="$1" -v rc="$2" -v rota="$3" -v size="$4" -v design="$SMART_DESIGN_HOURS" '
+    function after(s) { sub(/^[^:]*:[ \t]*/, "", s); return s }
+    # First number of a value, thousands separators removed ("12,345,678 [6.32 TB]")
+    function num(s) { gsub(/,/, "", s); return match(s, /[0-9]+(\.[0-9]+)?/) ? substr(s, RSTART, RLENGTH) : "" }
+    function clean(s) { gsub(/\|/, "/", s); sub(/[ \t\r]+$/, "", s); return s }
+    function setonce(key, v) { if (!(key in d) && v != "") d[key] = v }
+    # Unit of a vendor-specific ATA read/write counter, from its name
+    function unit(name) {
+        if (name ~ /NAND|Flash/) return 0
+        if (name ~ /32MiB$/)     return 33554432
+        if (name ~ /GiB$/)       return 1073741824
+        if (name ~ /MiB$/)       return 1048576
+        if (name ~ /GB$/)        return 1000000000
+        if (name ~ /LBA|Sector/)  return -1
+        return 0
+    }
+
+    BEGIN { lss = 512 }
+
+    /^Device Model:|^Model Number:/    { setonce("model", clean(after($0))) }
+    /^Vendor:/                         { vendor = clean(after($0)) }
+    /^Product:/                        { setonce("model", clean(after($0))) }
+    /^Serial [Nn]umber:/               { setonce("serial", clean(after($0))) }
+    /^Firmware Version:|^Revision:/    { setonce("firmware", clean(after($0))) }
+    /^User Capacity:|^Total NVM Capacity:|^Namespace 1 Size\/Capacity:/ {
+        v = after($0); sub(/\[.*/, "", v); gsub(/[^0-9]/, "", v)
+        if (v + 0 > 0) setonce("capacity", v)
+    }
+    /^Rotation Rate:/                  { v = after($0); d["rpm"] = (v ~ /Solid State/) ? 0 : num(v) }
+    /^Sector Sizes?:/                  { if (match($0, /[0-9]+ bytes logical/)) lss = substr($0, RSTART, RLENGTH) + 0 }
+    /^NVMe Version:|^=== START OF .*NVMe/ { iface = "nvme" }
+    /^ATA Version is:|^SATA Version is:/  { iface = "ata" }
+    /^Transport protocol:/             { iface = "scsi" }
+
+    # Health: ATA/NVMe "test result: PASSED", SCSI "SMART Health Status: OK"
+    /self-assessment test result:/     { d["health"] = clean(after($0)) }
+    /^SMART Health Status:/            { d["health"] = clean(after($0)) }
+
+    # NVMe health log
+    /^Temperature:/                    { setonce("temp", num(after($0))) }
+    /^Available Spare:/                { d["spare"] = num(after($0)) }
+    /^Available Spare Threshold:/      { d["spare_thr"] = num(after($0)) }
+    /^Percentage Used:/                { d["life_used"] = num(after($0)) }
+    # One data unit = 1000 blocks of 512 bytes
+    /^Data Units Read:/                { d["read"] = num(after($0)) * 512000 }
+    /^Data Units Written:/             { d["written"] = num(after($0)) * 512000 }
+    /^Power Cycles:/                   { d["cycles"] = num(after($0)) }
+    /^Power On Hours:/                 { d["poh"] = num(after($0)) }
+    /^Unsafe Shutdowns:/               { d["unsafe"] = num(after($0)) }
+    /^Media and Data Integrity Errors:/ { d["media"] = num(after($0)) }
+
+    # SCSI / SAS
+    /^Current Drive Temperature:/      { setonce("temp", num(after($0))) }
+    /^Accumulated power on time/       { v = $0; sub(/.*[ \t]/, "", v); split(v, hm, ":"); d["poh"] = hm[1] + 0 }
+    /^Accumulated start-stop cycles:/  { setonce("cycles", num(after($0))) }
+    /^Percentage used endurance indicator:/ { d["life_used"] = num(after($0)) }
+    /^Elements in grown defect list:/  { d["realloc"] = num(after($0)) }
+    # Error counter log: next to last column = gigabytes processed (10^9 bytes)
+    /^read:/  && NF >= 8               { d["read"] = $(NF - 1) * 1000000000 }
+    /^write:/ && NF >= 8               { d["written"] = $(NF - 1) * 1000000000 }
+
+    # ATA attribute table: ID NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW
+    $1 ~ /^[0-9]+$/ && $3 ~ /^0x[0-9a-f]+$/ && NF >= 10 {
+        iface = "ata"
+        name = $2; value = $4 + 0; worst = $5 + 0; thresh = $6 + 0
+        raw = match($10, /^[0-9]+/) ? substr($10, RSTART, RLENGTH) + 0 : ""
+
+        if (name ~ /^Power_On_Hours/)            d["poh"] = raw
+        else if (name == "Power_On_Minutes")     d["poh"] = int(raw / 60)
+        else if (name == "Power_On_Seconds")     d["poh"] = int(raw / 3600)
+        else if (name == "Power_On_Half_Minutes") d["poh"] = int(raw / 120)
+        else if (name == "Power_Cycle_Count")    d["cycles"] = raw
+        else if (name ~ /^Temperature_(Celsius|Internal|Case)$/) d["temp"] = raw
+        else if (name == "Airflow_Temperature_Cel") airflow = raw
+        else if (name == "Reallocated_Sector_Ct") {
+            d["realloc"] = raw
+            # Normalized value counts down from 100 (WD: 200) to the vendor
+            # threshold as spare sectors are used up.
+            start = (value > 100 || worst > 100) ? 200 : 100
+            if (start > thresh) realloc_spare = (value - thresh) * 100 / (start - thresh)
+        }
+        else if (name == "Current_Pending_Sector") d["pending"] = raw
+        else if (name == "Offline_Uncorrectable")  d["uncorr"] = raw
+        else if (name ~ /^(Available_Reservd_Space|Available_Reserve_Space|Unused_Rsvd_Blk_Cnt_Tot|Unused_Reserve_NAND_Blk)$/) {
+            if (!("spare" in d)) { d["spare"] = value > 100 ? 100 : value; d["spare_thr"] = thresh }
+            if (name ~ /^Unused/) d["unused"] = raw
+        }
+        # Remaining life in percent - the normalized value, name depends on the vendor
+        else if (name ~ /^(Percent_Lifetime_Remain|Remaining_Lifetime_Perc|Percent_Life_Remaining|SSD_Life_Left|Media_Wearout_Indicator|Wear_Leveling_Count)$/) {
+            prio = (name ~ /^Percent|^Remaining/) ? 1 : (name == "Wear_Leveling_Count") ? 3 : 2
+            if (!life_prio || prio < life_prio) { life_prio = prio; d["life_used"] = 100 - (value > 100 ? 100 : value) }
+        }
+        else if (name ~ /^(Total|Host|Lifetime)_/ && name ~ /Writ|Read/) {
+            u = unit(name)
+            if (u != 0) {
+                bytes = raw * (u < 0 ? lss : u)
+                if (name ~ /Writ/) setonce("written", bytes); else setonce("read", bytes)
+            }
+        }
+    }
+
+    { text = text "\n" $0 }
+
+    END {
+        if (!("temp" in d) && airflow != "") d["temp"] = airflow
+        if (!("spare" in d) && realloc_spare != "") { d["spare"] = sprintf("%.0f", realloc_spare); d["spare_thr"] = 0 }
+        if (vendor != "" && ("model" in d) && index(d["model"], vendor) != 1) d["model"] = vendor " " d["model"]
+        if (!("capacity" in d) && size > 0) d["capacity"] = size
+        if (iface == "" && dev ~ /^nvme/) iface = "nvme"
+
+        rpm = ("rpm" in d) ? d["rpm"] : ""
+        if (iface == "nvme")    kind = "nvme"
+        else if (rpm != "")     kind = (rpm == 0) ? "ssd" : "hdd"
+        else if (rota != "")    kind = (rota == 1) ? "hdd" : "ssd"
+        else                    kind = ""
+
+        state = "active"; err = ""
+        if (text ~ /Device is in (STANDBY|SLEEP|IDLE)/)                     state = "standby"
+        else if (rc == 124)                                                 err = "timeout"
+        else if (text ~ /Permission denied|Operation not permitted|must be root/) err = "permission"
+        else if (text ~ /No such (device|file)/)                           err = "missing"
+        else if (text ~ /SMART support is:[ \t]*Disabled/)                 err = "disabled"
+        else if (text ~ /Unable to detect device type|Unknown USB bridge|SMART support is:[ \t]*Unavailable|lacks SMART capability/) err = "unsupported"
+        else if (!("poh" in d) && !("health" in d))                        err = (rc > 0) ? "rc-" rc : "no-data"
+        if (err != "") state = "error"
+
+        # Theoretical remaining lifetime: extrapolate from wear and from used
+        # spare sectors at the rate seen so far; hard disks have no wear gauge,
+        # there the assumed service life counts. The shortest estimate wins.
+        rem = ""; basis = ""
+        poh = ("poh" in d) ? d["poh"] + 0 : -1
+        if (poh > 0 && ("life_used" in d)) {
+            lu = d["life_used"] + 0
+            if (lu >= 100)   { rem = 0; basis = "wear" }
+            else if (lu > 0) { rem = poh * (100 - lu) / lu; basis = "wear" }
+        }
+        if (poh > 0 && ("spare" in d)) {
+            sp = d["spare"] + 0; thr = d["spare_thr"] + 0
+            if (sp <= thr)      { rem = 0; basis = "spare" }
+            else if (sp < 100)  { r = poh * (sp - thr) / (100 - sp); if (rem == "" || r < rem) { rem = r; basis = "spare" } }
+        }
+        if (poh >= 0 && kind == "hdd" && design > 0) {
+            r = design - poh; if (r < 0) r = 0
+            if (rem == "" || r < rem) { rem = r; basis = "design" }
+        }
+        if (rem != "") rem = sprintf("%.0f", rem)
+
+        printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n",
+            dev, kind, d["model"], d["serial"], d["firmware"], d["capacity"], rpm, d["health"], d["temp"],
+            d["poh"], d["cycles"],
+            ("read" in d) ? sprintf("%.0f", d["read"]) : "", ("written" in d) ? sprintf("%.0f", d["written"]) : "",
+            d["life_used"], d["spare"], d["spare_thr"], d["realloc"], d["pending"], d["uncorr"], d["unused"],
+            d["media"], d["unsafe"], rem, basis, state, err
+    }'
+}
+
+get_smart_info() {
+    # First line: smartctl_version|error, then one smart_parse line per drive.
+    # The drives are queried in parallel: a slow USB bridge or a disk that
+    # takes a second per query must not add up over a dozen disks.
+    local path ver cmd=() tmp dev rota size
+    path=$(command -v smartctl 2>/dev/null)
+    if [ -z "$path" ]; then
+        echo "|no-smartctl"
+        return 0
+    fi
+    ver=$(LC_ALL=C "$path" -V 2>/dev/null | awk 'NR == 1 { print $2 }')
+
+    cmd=("$path")
+    # Not root: a sudo rule for smartctl alone (NOPASSWD) is enough
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1 && sudo -n -l "$path" >/dev/null 2>&1; then
+            cmd=(sudo -n "$path")
+        fi
+    fi
+    echo "$ver|"
+
+    tmp=$(mktemp -d 2>/dev/null) || return 0
+    mapfile -t devs < <(smart_devices)
+    for dev in "${devs[@]}"; do
+        [[ "$dev" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+        # -n standby: a spun down disk stays asleep, smartctl reports it instead
+        ( LC_ALL=C timeout "$SMART_TIMEOUT" "${cmd[@]}" -a -n standby "/dev/$dev" > "$tmp/$dev.out" 2>&1
+          echo $? > "$tmp/$dev.rc" ) &
+    done
+    wait
+
+    for dev in "${devs[@]}"; do
+        [ -f "$tmp/$dev.rc" ] || continue
+        rota=""; size=0
+        [ -r "/sys/block/$dev/queue/rotational" ] && read -r rota < "/sys/block/$dev/queue/rotational"
+        [ -r "/sys/block/$dev/size" ] && read -r size < "/sys/block/$dev/size"
+        smart_parse "$dev" "$(cat "$tmp/$dev.rc")" "$rota" "$(( ${size:-0} * 512 ))" < "$tmp/$dev.out"
+    done
+    rm -rf "$tmp"
 }
 
 cpu_snapshot() {
@@ -359,14 +617,17 @@ json_disk() {
 }
 
 json_gpu() {
-    local gpu_raw count i gname gtemp gpwr gutil
+    local gpu_raw count i gname gtemp gpwr gutil gidx mused mtotal plimit fan pstate driver
     mapfile -t gpu_raw < <(get_gpu_info)
     echo "  \"gpus\": ["
     count=${#gpu_raw[@]}
     for ((i=0; i<$count; i++)); do
-        IFS='|' read -r gname gtemp gpwr gutil <<< "${gpu_raw[$i]}"
-        printf "    {\"id\": %d, \"name\": \"%s\", \"temp\": \"%s\", \"power\": \"%s\", \"utilization\": \"%s\"}%s\n" \
-            "$i" "$(json_escape "$gname")" "$gtemp" "$gpwr" "$gutil" "$([ $i -lt $((count-1)) ] && echo ',')"
+        IFS='|' read -r gname gtemp gpwr gutil gidx mused mtotal plimit fan pstate driver <<< "${gpu_raw[$i]}"
+        printf '    {"id": %d, "name": "%s", "temp": "%s", "power": "%s", "utilization": "%s", "memory_used_bytes": %s, "memory_total_bytes": %s, "power_limit_w": %s, "fan_percent": %s, "pstate": "%s", "driver": "%s"}%s\n' \
+            "${gidx:-$i}" "$(json_escape "$gname")" "$gtemp" "$gpwr" "$gutil" \
+            "${mused:-null}" "${mtotal:-null}" "${plimit:-null}" "${fan:-null}" \
+            "$(json_escape "$pstate")" "$(json_escape "$driver")" \
+            "$([ $i -lt $((count-1)) ] && echo ',')"
     done
     echo -n "  ]"
 }
@@ -404,6 +665,26 @@ json_wan() {
         "$ip" "${lat:-null}" "${resp:-null}" "$err" "$(json_escape "$WAN_URL")"
 }
 
+json_smart() {
+    local raw ver err count i
+    local dev kind model serial fw cap rpm health temp poh cyc rd wr lu sp spt rel pend unc unused media unsafe rem basis state derr
+    mapfile -t raw < <(get_smart_info)
+    IFS='|' read -r ver err <<< "${raw[0]}"
+    printf '  "smart": {"smartctl": "%s", "error": "%s", "design_hours": %s, "devices": [\n' \
+        "$(json_escape "$ver")" "$err" "${SMART_DESIGN_HOURS:-null}"
+    count=$(( ${#raw[@]} - 1 ))
+    for ((i=1; i<=count; i++)); do
+        IFS='|' read -r dev kind model serial fw cap rpm health temp poh cyc rd wr lu sp spt rel pend unc unused media unsafe rem basis state derr <<< "${raw[$i]}"
+        printf '    {"device": "%s", "kind": "%s", "model": "%s", "serial": "%s", "firmware": "%s", "capacity_bytes": %s, "rpm": %s, "health": "%s", "temp_c": %s, "power_on_hours": %s, "power_cycles": %s, "read_bytes": %s, "written_bytes": %s, "life_used_percent": %s, "spare_percent": %s, "spare_threshold_percent": %s, "reallocated_sectors": %s, "pending_sectors": %s, "uncorrectable_sectors": %s, "unused_reserve_blocks": %s, "media_errors": %s, "unsafe_shutdowns": %s, "life_remaining_hours": %s, "life_basis": "%s", "state": "%s", "error": "%s"}%s\n' \
+            "$(json_escape "$dev")" "$kind" "$(json_escape "$model")" "$(json_escape "$serial")" "$(json_escape "$fw")" \
+            "${cap:-null}" "${rpm:-null}" "$(json_escape "$health")" "${temp:-null}" "${poh:-null}" "${cyc:-null}" \
+            "${rd:-null}" "${wr:-null}" "${lu:-null}" "${sp:-null}" "${spt:-null}" "${rel:-null}" "${pend:-null}" \
+            "${unc:-null}" "${unused:-null}" "${media:-null}" "${unsafe:-null}" "${rem:-null}" "$basis" "$state" "$derr" \
+            "$([ $i -lt $count ] && echo ',')"
+    done
+    echo -n "  ]}"
+}
+
 # --- Output Logic ---
 
 if [ "$1" == "json" ]; then
@@ -431,6 +712,7 @@ if [ "$1" == "json" ]; then
             diskio) parts+=("$(json_diskio)") ;;
             net)    parts+=("$(json_net)") ;;
             wan)    parts+=("$(json_wan)") ;;
+            smart)  parts+=("$(json_smart)") ;;
             *)      echo "sysinfo: unknown section '$s'" >&2; exit 2 ;;
         esac
     done

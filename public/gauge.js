@@ -23,7 +23,7 @@
     const HEAT = ['#0d366b', '#104281', '#184f95', '#1c5cab', '#256abf', '#2a78d6', '#3987e5', '#5598e7', '#6da7ec', '#86b6ef'];
 
     // Welche Karte zeigt welchen Datenschluessel des Snapshots
-    const CARDS = { cpu: 'card-cpu', memory: 'card-mem', network: 'card-net', disk_io: 'card-io', filesystems: 'card-fs', temperatures: 'sensors', wan: 'net-wan' };
+    const CARDS = { cpu: 'card-cpu', memory: 'card-mem', network: 'card-net', gpus: 'card-gpu', disk_io: 'card-io', filesystems: 'card-fs', temperatures: 'sensors', wan: 'net-wan', smart: 'fs-smart' };
 
     // Kurzcodes aus sysinfo (Abschnitt wan) -> Anzeigetext
     const WAN_ERRORS = {
@@ -32,8 +32,25 @@
     };
     const wanError = (e) => WAN_ERRORS[e] || (/^http-\d+$/.test(e) ? 'HTTP ' + e.slice(5) : e);
 
+    // Kurzcodes aus sysinfo (Abschnitt smart) -> Anzeigetext
+    const SMART_ERRORS = {
+        'no-smartctl': 'smartctl nicht installiert – apt install smartmontools',
+        permission: 'Keine Berechtigung – Poller als root starten oder sudo-Regel für smartctl',
+        unsupported: 'Kein SMART (virtuelles Laufwerk oder USB-Brücke)',
+        disabled: 'SMART ist abgeschaltet (smartctl -s on)',
+        timeout: 'Laufwerk antwortet nicht (Zeitüberschreitung)',
+        missing: 'Gerät nicht gefunden',
+        'no-data': 'Laufwerk meldet keine SMART-Werte',
+    };
+    const smartError = (e) => SMART_ERRORS[e] || (/^rc-\d+$/.test(e) ? 'smartctl meldet Fehler ' + e.slice(3) : e);
+
     const SENSOR_WARN = 80;
     const SENSOR_CRIT = 95;
+    // Laufwerke: SMART-Grenzwerte kennen keine Warnstufe, 20 / 10 % Restlebensdauer
+    // sind die ueblichen Schwellen der Hersteller-Tools
+    const LIFE_WARN = 20;
+    const LIFE_CRIT = 10;
+    const HOURS_PER_YEAR = 8766;
 
     // --- Formatierung --------------------------------------------------------
 
@@ -74,6 +91,30 @@
         if (!ok(s)) return '–';
         const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
         return (d ? d + ' T ' : '') + h + ' Std ' + String(m).padStart(2, '0') + ' Min';
+    }
+
+    // Betriebsstunden: "4 J 186 T" - Jahre sagen bei Laufwerken mehr als 39.512 Std
+    function hoursSpan(h) {
+        if (!ok(h)) return '–';
+        const y = Math.floor(h / HOURS_PER_YEAR), d = Math.floor((h % HOURS_PER_YEAR) / 24);
+        if (y) return `${y} J ${d} T`;
+        if (d) return `${d} T ${Math.floor(h % 24)} Std`;
+        return num(h) + ' Std';
+    }
+
+    // Hochrechnung, keine Messung: grob runden, sonst wirkt sie genauer als sie ist
+    function remainingSpan(h) {
+        if (!ok(h)) return null;
+        if (h <= 0) return '0';
+        const years = h / HOURS_PER_YEAR;
+        if (years >= 20) return 'über 20 Jahre';
+        if (years >= 1) {
+            const y = Math.floor(years), m = Math.floor((years - y) * 12);
+            return `ca. ${y} J` + (m ? ` ${m} Mon` : '');
+        }
+        const months = h / (HOURS_PER_YEAR / 12);
+        if (months >= 1) return `ca. ${Math.floor(months)} Mon`;
+        return `ca. ${Math.max(1, Math.floor(h / 24))} T`;
     }
 
     const every = (ms) => (ms >= 1000 ? num(ms / 1000, ms % 1000 ? 1 : 0) + ' s' : ms + ' ms');
@@ -151,7 +192,10 @@
 
         draw() {
             const { w, h, o, t } = this;
-            if (w < 30 || h < 30) return;
+            // In verdichteten Listen ist das Diagramm nur eine Zeile hoch: dann
+            // ohne Achsenbeschriftung, sonst bliebe fuer die Linie kaum Platz
+            const bare = this.host.closest('.compact') !== null;
+            if (w < 30 || h < (bare ? 16 : 30)) return;
 
             const ctx = this.canvas.getContext('2d');
             ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -170,9 +214,9 @@
             const yMax = o.yMax ?? niceCeil(Math.max(o.minMax, max * 1.08) * o.scale) / o.scale;
 
             const top = o.format(yMax), mid = o.format(yMax / 2);
-            const padR = Math.ceil(Math.max(ctx.measureText(top).width, ctx.measureText(mid).width)) + 10;
-            const padT = Math.ceil(this.fontPx * 0.7);
-            const padB = Math.ceil(this.fontPx * 1.6);
+            const padR = bare ? 0 : Math.ceil(Math.max(ctx.measureText(top).width, ctx.measureText(mid).width)) + 10;
+            const padT = bare ? 2 : Math.ceil(this.fontPx * 0.7);
+            const padB = bare ? 2 : Math.ceil(this.fontPx * 1.6);
             const x0 = 0, x1 = w - padR, y0 = padT, y1 = h - padB;
 
             const X = (tt) => x0 + ((tt - tStart) / this.win) * (x1 - x0);
@@ -188,15 +232,17 @@
             ctx.strokeStyle = C.axis;
             ctx.beginPath(); ctx.moveTo(x0, Math.round(y1) + 0.5); ctx.lineTo(x1, Math.round(y1) + 0.5); ctx.stroke();
 
-            ctx.fillStyle = C.muted;
-            ctx.textBaseline = 'middle';
-            ctx.textAlign = 'left';
-            ctx.fillText(top, x1 + 6, Y(yMax));
-            ctx.fillText(mid, x1 + 6, Y(yMax / 2));
-            ctx.textBaseline = 'alphabetic';
-            ctx.fillText('−' + span(this.win), x0, h - 3);
-            ctx.textAlign = 'right';
-            ctx.fillText('jetzt', x1, h - 3);
+            if (!bare) {
+                ctx.fillStyle = C.muted;
+                ctx.textBaseline = 'middle';
+                ctx.textAlign = 'left';
+                ctx.fillText(top, x1 + 6, Y(yMax));
+                ctx.fillText(mid, x1 + 6, Y(yMax / 2));
+                ctx.textBaseline = 'alphabetic';
+                ctx.fillText('−' + span(this.win), x0, h - 3);
+                ctx.textAlign = 'right';
+                ctx.fillText('jetzt', x1, h - 3);
+            }
 
             ctx.save();
             ctx.beginPath();
@@ -299,7 +345,7 @@
         seqs: {},
         hist: {},
         charts: {},
-        rows: { net: new Map(), io: new Map() },
+        rows: { net: new Map(), io: new Map(), gpu: new Map() },
         link: null,
     };
 
@@ -357,6 +403,51 @@
         void p.offsetWidth; // Animation neu starten
         p.classList.add('beat');
     }
+
+    // --- Platz: erst verdichten, dann scrollen --------------------------------
+
+    /**
+     * Passt eine Liste (Schnittstellen, Datentraeger, Laufwerke) nicht mehr in
+     * ihre Karte, wird sie verdichtet: eine Zeile je Eintrag, Diagramm als
+     * Sparkline. Reicht auch das nicht, scrollt die Liste - auf dem Kiosk von
+     * selbst, dort bedient niemand die Maus.
+     */
+    const fitHosts = new Set();
+
+    function refit(host) {
+        host.classList.remove('compact');
+        if (host.scrollHeight > host.clientHeight + 2) host.classList.add('compact');
+    }
+
+    function fit(host) {
+        if (!fitHosts.has(host)) {
+            fitHosts.add(host);
+            // Die Liste selbst beobachten, nicht die Karte: auch der Internet-Block
+            // oder die Laufwerksliste darueber aendern ihren Platz
+            if ('ResizeObserver' in window) new ResizeObserver(() => refit(host)).observe(host);
+            else window.addEventListener('resize', () => refit(host));
+            host.addEventListener('pointerenter', () => { host.dataset.hold = '1'; });
+            host.addEventListener('pointerleave', () => { delete host.dataset.hold; });
+        }
+        refit(host);
+    }
+
+    /** Fuer Listen, die jede Sekunde neu gezeichnet werden: nur bei neuer Anzahl messen. */
+    function fitCount(host, n) {
+        if (host.dataset.n === String(n)) return;
+        host.dataset.n = n;
+        fit(host);
+    }
+
+    // Alle 6 s eine Seite weiter, am Ende zurueck nach oben. Solange die Maus
+    // ueber der Liste steht, bleibt sie stehen.
+    setInterval(() => {
+        for (const host of fitHosts) {
+            if (host.dataset.hold || host.scrollHeight <= host.clientHeight + 2) continue;
+            const atEnd = host.scrollTop + host.clientHeight >= host.scrollHeight - 2;
+            host.scrollTo({ top: atEnd ? 0 : host.scrollTop + host.clientHeight * 0.8, behavior: 'smooth' });
+        }
+    }, 6000);
 
     // --- Karten --------------------------------------------------------------
 
@@ -432,12 +523,11 @@
             .replace(/^nvme /, 'NVMe ');
     }
 
-    function renderSensors(temps, gpus) {
+    function renderSensors(temps) {
         const host = $('sensor-chips');
         host.textContent = '';
 
         temps = temps || [];
-        gpus = gpus || [];
 
         const cpuTemps = temps.filter((t) => t.group === 'cpu');
         const cpuMax = cpuTemps.length ? Math.max(...cpuTemps.map((t) => t.celsius)) : null;
@@ -458,10 +548,6 @@
         for (const t of shown) {
             const level = t.celsius >= SENSOR_CRIT ? 'crit' : t.celsius >= SENSOR_WARN ? 'warn' : '';
             chip(sensorLabel(t.label), num(t.celsius) + ' °C', level);
-        }
-        for (const g of gpus) {
-            const parts = [ok(g.percent) && pct(g.percent), ok(g.celsius) && num(g.celsius) + ' °C', ok(g.watt) && num(g.watt) + ' W'].filter(Boolean);
-            chip(`GPU ${g.id} ${g.name}`, parts.join(' · ') || '–', ok(g.celsius) && g.celsius >= SENSOR_WARN ? 'warn' : '');
         }
         if (!host.children.length) host.append(el('span', 'empty', 'Keine Sensoren gefunden'));
     }
@@ -562,6 +648,7 @@
             feed(r.chart, 'network');
         }
         dropMissing(state.rows.net, seen, host);
+        fitCount(host, state.rows.net.size);
     }
 
     function renderWan(w) {
@@ -579,6 +666,57 @@
             format: (v) => num(v) + ' ms',
         }));
         feed(chart, 'wan');
+    }
+
+    function renderGpus(list) {
+        const host = $('gpu-list');
+        const seen = new Set();
+
+        for (const g of list) {
+            const id = String(g.id);
+            seen.add(id);
+
+            // Unified Memory (DGX Spark) meldet keinen eigenen Grafikspeicher: dann
+            // weder Wert noch Linie, statt dauerhaft "–" und einer leeren Serie
+            const hasMem = ok(g.memory_total);
+            let r = state.rows.gpu.get(id);
+            if (r && r.hasMem !== hasMem) { r.row.remove(); r = null; }
+            if (!r) {
+                const labels = [['Auslastung', C.s1]];
+                const series = [{ key: 'util:' + id, label: 'Auslastung', color: C.s1, fill: true }];
+                if (hasMem) {
+                    labels.push(['Grafikspeicher', C.s2]);
+                    series.push({ key: 'mem:' + id, label: 'Grafikspeicher', color: C.s2 });
+                }
+                r = buildRow(host, labels, { series, yMax: 100, format: (v) => pct(v) });
+                r.hasMem = hasMem;
+                state.rows.gpu.set(id, r);
+            }
+
+            // Bei einer Karte reicht der Name, bei mehreren braucht es den Index
+            r.name.textContent = (list.length > 1 ? `GPU ${id} · ` : '') + g.name;
+            r.name.title = g.name;
+
+            r.meta.textContent = '';
+            if (ok(g.celsius)) {
+                const level = g.celsius >= SENSOR_CRIT ? 'crit' : g.celsius >= SENSOR_WARN ? 'warn' : '';
+                r.meta.append(el('b', level, (level ? '⚠ ' : '') + num(g.celsius) + ' °C'));
+            }
+            const power = ok(g.watt) ? num(g.watt) + (ok(g.watt_limit) ? ' / ' + num(g.watt_limit) : '') + ' W' : '';
+            if (power) r.meta.append(document.createTextNode((r.meta.childNodes.length ? ' · ' : '') + power));
+
+            r.values[0].textContent = pct(g.percent);
+            r.values[1].textContent = pct(g.memory_percent);
+            r.foot.textContent = [
+                ok(g.memory_total) && `${bytes(g.memory_used)} von ${bytes(g.memory_total)}`,
+                ok(g.fan_percent) && 'Lüfter ' + pct(g.fan_percent),
+                g.pstate,
+                g.driver && 'Treiber ' + g.driver,
+            ].filter(Boolean).join(' · ') || ' ';
+            feed(r.chart, 'gpus');
+        }
+        dropMissing(state.rows.gpu, seen, host);
+        fitCount(host, state.rows.gpu.size);
     }
 
     function renderDiskIo(list) {
@@ -616,6 +754,7 @@
             feed(r.chart, 'disk_io');
         }
         dropMissing(state.rows.io, seen, host);
+        fitCount(host, state.rows.io.size);
     }
 
     const DRIVE_ICON = '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">'
@@ -663,6 +802,169 @@
         $('fs-summary').textContent = count
             ? `${count} ${count === 1 ? 'Laufwerk' : 'Laufwerke'} · ${bytes(free)} frei von ${bytes(total)} gesamt`
             : 'Keine Laufwerke gefunden';
+        fit(host);
+    }
+
+    const SSD_ICON = '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">'
+        + '<rect x="6" y="10" width="36" height="28" rx="3"/><rect x="12" y="16" width="10" height="8" rx="1"/>'
+        + '<rect x="26" y="16" width="10" height="8" rx="1"/><path d="M12 31h24"/></svg>';
+
+    // Herstellerangaben sind dezimal: eine "4 TB"-Platte soll auch 4,0 TB heissen
+    function capacity(b) {
+        if (!ok(b)) return '';
+        return b >= 1e12 ? num(b / 1e12, 1) + ' TB' : num(b / 1e9, 0) + ' GB';
+    }
+
+    function driveKind(d) {
+        if (d.kind === 'nvme') return 'NVMe-SSD';
+        if (d.kind === 'ssd') return 'SSD';
+        if (d.kind === 'hdd') return 'HDD' + (d.rpm > 0 ? ` ${num(d.rpm)} U/min` : '');
+        return '';
+    }
+
+    function gauge(label, value, percent, level) {
+        const box = el('div', 'gauge' + (level ? ' ' + level : ''));
+        const head = el('div', 'g-head');
+        head.append(el('span', '', label), el('b', '', (level ? '⚠ ' : '') + value));
+        const meter = el('span', 'meter');
+        const fill = el('i');
+        fill.style.width = clamp(percent, 0, 100) + '%';
+        meter.append(fill);
+        box.append(head, meter);
+        return box;
+    }
+
+    /** Gelesen / Geschrieben in allen Einheiten - die Umrechnung liefert cSysinfo. */
+    function transferTable(d) {
+        const rows = [['Gelesen', d.read], ['Geschrieben', d.written]].filter(([, v]) => v);
+        if (!rows.length) return el('div', 'xfer-none', 'Lese-/Schreibzähler meldet das Laufwerk nicht');
+
+        const table = el('table', 'xfer');
+        const head = el('tr');
+        for (const h of ['', 'TB', 'GB', 'Mbit', 'bit']) head.append(el('th', '', h));
+        table.append(head);
+        for (const [label, v] of rows) {
+            const tr = el('tr');
+            tr.append(el('th', '', label), el('td', '', num(v.tb, 2)), el('td', '', num(v.gb, 1)),
+                el('td', '', num(v.mbit, 0)), el('td', '', num(v.bit, 0)));
+            table.append(tr);
+        }
+        return table;
+    }
+
+    function smartTile(d, design) {
+        const hasData = ok(d.power_on_hours) || d.health !== '';
+        const tile = el('div', 'disk');
+        tile.innerHTML = d.kind === 'hdd' ? DRIVE_ICON : SSD_ICON;
+
+        const title = el('div', 'title');
+        title.append(el('span', '', [d.device, d.model].filter(Boolean).join(' · ')));
+        let badge;
+        if (d.healthy === true) badge = el('small', 'badge good', '✓ ' + (d.health === 'PASSED' ? 'OK' : d.health));
+        else if (d.healthy === false) badge = el('small', 'badge crit', '⚠ ' + d.health);
+        else if (d.state === 'standby') badge = el('small', 'badge', 'Standby');
+        else badge = el('small', 'badge', '–');
+        title.append(badge);
+        tile.append(title);
+        title.title = [d.model, d.serial && 'S/N ' + d.serial, d.firmware && 'Firmware ' + d.firmware].filter(Boolean).join(' · ');
+
+        let level = d.healthy === false ? 'crit' : '';
+        const raise = (l) => { if (l === 'crit' || (l === 'warn' && !level)) level = l; };
+
+        if (!hasData) {
+            const text = d.state === 'standby' ? '◐ Im Standby – wird für SMART nicht aufgeweckt' : '⚠ ' + smartError(d.error || 'no-data');
+            tile.append(el('div', 'note', text));
+            tile.classList.toggle('muted', true);
+            return tile;
+        }
+
+        const temp = ok(d.celsius) ? num(d.celsius) + ' °C' : '';
+        tile.append(el('div', 'meta', [driveKind(d), capacity(d.capacity), temp].filter(Boolean).join(' · ')));
+
+        // Lebensdauer: SSDs melden ihren Verschleiss, Festplatten nicht - dort
+        // zaehlt die Betriebszeit gegen die angenommene Auslegung (design_hours)
+        const gauges = el('div', 'gauges');
+        if (ok(d.life_left)) {
+            const l = d.life_left <= LIFE_CRIT ? 'crit' : d.life_left <= LIFE_WARN ? 'warn' : '';
+            raise(l);
+            gauges.append(gauge('Lebensdauer', pct(d.life_left) + ' übrig', d.life_left, l));
+        } else if (d.kind === 'hdd' && design > 0) {
+            const left = Math.max(0, 100 - (d.power_on_hours / design) * 100);
+            gauges.append(gauge(`Auslegung (${num(design / HOURS_PER_YEAR)} J)`, pct(left) + ' übrig', left, left <= LIFE_CRIT ? 'warn' : ''));
+        }
+        if (ok(d.spare)) {
+            const thr = d.spare_threshold || 0;
+            const l = d.spare <= thr ? 'crit' : d.spare <= thr + 20 ? 'warn' : '';
+            raise(l);
+            const blocks = ok(d.unused_reserve_blocks) ? ` · ${num(d.unused_reserve_blocks)} frei` : '';
+            gauges.append(gauge('Reservesektoren', pct(d.spare) + blocks, d.spare, l));
+        }
+        if (gauges.children.length) tile.append(gauges);
+
+        const stats = el('dl', 'stats disk-stats');
+        // minor: verdichtet ausgeblendet
+        const stat = (k, v, cls, minor) => {
+            if (!v) return;
+            const m = minor ? ' minor' : '';
+            stats.append(el('dt', m.trim(), k), el('dd', ((cls || '') + m).trim(), v));
+        };
+
+        stat('Betriebszeit', ok(d.power_on_hours) ? `${hoursSpan(d.power_on_hours)} (${num(d.power_on_hours)} Std)` : '');
+        stat('Einschaltungen', ok(d.power_cycles)
+            ? num(d.power_cycles) + (ok(d.hours_per_cycle) ? ` · Ø ${num(d.hours_per_cycle, d.hours_per_cycle < 10 ? 1 : 0)} Std je Lauf` : '')
+            : '', '', true);
+
+        const basis = { wear: 'nach Verschleiß', spare: 'nach Reserveverbrauch', design: 'nach Auslegung' }[d.remaining_basis] || '';
+        let rest = remainingSpan(d.remaining_hours);
+        let restCls = '';
+        if (rest === '0') {
+            rest = d.remaining_basis === 'design' ? '⚠ Auslegung überschritten' : '⚠ aufgebraucht';
+            restCls = d.remaining_basis === 'design' ? 'warn' : 'crit';
+            raise(restCls);
+        } else if (rest) {
+            rest += ' · ' + basis;
+        } else if (ok(d.life_left) && d.life_left >= 100) {
+            rest = 'noch kein messbarer Verschleiß';
+        }
+        stat('Restlaufzeit (theor.)', rest, restCls);
+
+        // Sektoren und Fehlerzaehler - ausstehende und nicht korrigierbare Sektoren
+        // sind die fruehesten Vorboten eines Plattenausfalls
+        const errs = [];
+        const count = (v, text, l) => {
+            if (!ok(v)) return;
+            if (v > 0 && l) raise(l);
+            errs.push((v > 0 && l ? '⚠ ' : '') + num(v) + ' ' + text);
+        };
+        count(d.reallocated, 'ersetzt', d.kind === 'nvme' ? '' : 'warn');
+        count(d.pending, 'ausstehend', 'warn');
+        count(d.uncorrectable, 'nicht korrigierbar', 'crit');
+        count(d.media_errors, 'Medienfehler', 'crit');
+        count(d.unsafe_shutdowns, '× unsicher aus', '');
+        stat(d.kind === 'nvme' ? 'Fehler' : 'Sektoren', errs.join(' · '));
+        tile.append(stats);
+
+        tile.append(transferTable(d));
+        // Verdichtet ersetzt diese eine Zeile die Tabelle
+        const short = [d.read && '↓ ' + num(d.read.tb, 2) + ' TB', d.written && '↑ ' + num(d.written.tb, 2) + ' TB'].filter(Boolean).join(' · ');
+        tile.append(el('div', 'xfer-short', short || ' '));
+
+        if (d.state === 'standby') tile.append(el('div', 'note', '◐ Im Standby – Werte der letzten Messung'));
+        if (level) tile.classList.add(level);
+        return tile;
+    }
+
+    function renderSmart(s) {
+        const host = $('smart-list');
+        host.textContent = '';
+        const list = s.devices || [];
+
+        if (s.error) host.append(el('p', 'empty', '⚠ ' + smartError(s.error)));
+        else if (!list.length) host.append(el('p', 'empty', 'Keine Laufwerke gefunden'));
+        for (const d of list) host.append(smartTile(d, s.design_hours));
+
+        // Kacheln wechseln zwischen Daten und Hinweis - jedes Mal neu messen
+        fit(host);
     }
 
     function renderFoot(tiers) {
@@ -675,6 +977,16 @@
                 + (tier.missed ? ` · ${tier.missed} ausgelassen` : '')
             ));
             if (tier.error) item.append(el('span', 'err', ' · ' + tier.error));
+            foot.append(item);
+        }
+
+        // Stand des sysinfo-Skripts; ein fehlgeschlagenes Ersetzen von
+        // /usr/bin/sysinfo muss auf dem Schirm auffallen, nicht nur im Log
+        const si = CFG.sysinfo || {};
+        if (si.version || si.error) {
+            const item = el('span');
+            item.append(el('b', '', 'sysinfo'), document.createTextNode(si.version ? ' ' + si.version : ''));
+            if (si.error) item.append(el('span', 'err', ' · ' + si.error));
             foot.append(item);
         }
     }
@@ -745,14 +1057,23 @@
 
         if (d.system && fresh('system')) renderSystem(d.system);
         if (d.cpu && fresh('cpu')) { renderCpu(d.cpu); beat('card-cpu'); }
-        if (d.temperatures && fresh('temperatures')) { renderSensors(d.temperatures, d.gpus); beat('sensors'); }
+        if (d.temperatures && fresh('temperatures')) { renderSensors(d.temperatures); beat('sensors'); }
         if (d.memory && fresh('memory')) { renderMemory(d.memory); beat('card-mem'); }
         if (d.network && fresh('network')) { renderNetwork(d.network); beat('card-net'); }
         // Ohne wan-Takt in config.json bleibt der Block aus, statt ewig "–" zu zeigen
         $('net-wan').hidden = !tierOf('wan')[0];
         if (d.wan && fresh('wan')) { renderWan(d.wan); beat('net-wan'); }
+        // Grafikkarte nur, wenn nvidia-smi eine meldet - sonst behalten I/O und
+        // Laufwerke ihre volle Breite
+        const hasGpu = !!tierOf('gpus')[0] && (d.gpus || []).length > 0;
+        $('card-gpu').hidden = !hasGpu;
+        $('grid').classList.toggle('has-gpu', hasGpu);
+        if (hasGpu && fresh('gpus')) { renderGpus(d.gpus); beat('card-gpu'); }
         if (d.disk_io && fresh('disk_io')) { renderDiskIo(d.disk_io); beat('card-io'); }
         if (d.filesystems && fresh('filesystems')) { renderFilesystems(d.filesystems); beat('card-fs'); }
+        // Ohne smart-Takt in config.json bleibt der Block aus
+        $('fs-smart').hidden = !tierOf('smart')[0];
+        if (d.smart && fresh('smart')) { renderSmart(d.smart); beat('fs-smart'); }
 
         renderFoot(snap.tiers || {});
 
