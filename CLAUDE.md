@@ -14,12 +14,21 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   Poller startet ihn als eigenen Prozess, damit ein haengender Server die
   lokalen Takte nicht aufhaelt. Ebenso `gpu` (nvidia-smi, eigener Takt): ohne
   Persistence Mode dauert ein Aufruf bis zu Sekunden. Die Grafikkarten-Karte
-  erscheint nur, wenn eine Karte gemeldet wird.
+  erscheint nur, wenn eine Karte gemeldet wird. Ebenso `smart` (smartctl -a
+  je Laufwerk, parallel, `-n standby` weckt keine Platte; Takt 5 min, eigenes
+  Zeitlimit `gauge.smart.timeout`): Lebensdauer, Reservesektoren, Betriebszeit,
+  Lese-/Schreibmenge und eine Hochrechnung der Restlaufzeit. Braucht root oder
+  eine sudo-Regel fuer smartctl. Anzeige in der Karte Laufwerke.
+- `/usr/bin/sysinfo` haelt `cSysinfo::install()` auf dem Stand der Projektdatei
+  (`gauge.install`, Vergleich per SHA-256): beim Poller-Start und bei jedem
+  Aufruf des Dashboards, das nach dem Ersetzen per 303 neu laedt.
 - `app/cSysinfo.php` - ruft sysinfo auf und macht aus den Strings Zahlen.
 - `app/cGaugePoller.php` - Backpoller: misst in Takten (`gauge.tiers`), schreibt
   `db/metrics.json` (tmp + rename). Start/Stopp ueber `poller.sh`.
 - `views/api_metrics.php` - liest nur den Snapshot, misst nie selbst.
 - `views/dashboard.php` + `public/gauge.js` / `gauge.css` - Kiosk-Oberflaeche.
+  Listen, die nicht in ihre Karte passen, werden verdichtet (`.compact`, eine
+  Zeile je Eintrag) und scrollen danach von selbst.
 - Webserver: `webserver.sh` (Port 8090 - 8080 belegt PackageLoggerPHP).
 - Kiosk: ebenfalls `webserver.sh` (Abschnitt `kiosk` in `config.json`). Beim
   Start sucht es eine grafische Sitzung am Geraet (Wayland-/X-Socket aus der
