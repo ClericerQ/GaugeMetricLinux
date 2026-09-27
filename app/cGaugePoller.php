@@ -348,6 +348,13 @@ class cGaugePoller {
             return array_values(array_filter($value, fn(array $fs): bool => !$this->matches($fs['mount'], $exclude)));
         }
 
+        // Offene Thermistor-Eingaenge am Board-Chip liefern 100 C und mehr -
+        // das kann sysinfo nicht von echter Hitze trennen, also gezielt je Kanal.
+        if ($key === 'temperatures') {
+            $exclude = (array) ($this->cfg['sensors']['exclude'] ?? []);
+            return array_values(array_filter($value, fn(array $t): bool => !$this->matches($t['label'], $exclude)));
+        }
+
         if ($key === 'smart') {
             return $this->filterSmart($value);
         }
