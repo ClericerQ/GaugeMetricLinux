@@ -16,7 +16,7 @@
         "docroot": "{dir}public/",
         "launch_ips": [
             "127.0.0.1",
-            "192.168.76.8"
+            "0.0.0.0"
         ],
         "pid_file": "{dir}log/webserver.pid",
         "lock_file": "{dir}log/webserver.lock",
