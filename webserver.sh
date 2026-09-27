@@ -6,6 +6,53 @@ CONFIG="${DIR}config.json"
 
 [[ -r "$CONFIG" ]] || { echo "webserver: $CONFIG nicht lesbar" >&2; exit 1; }
 
+# Fehlt PHP, kommt es aus dem Sury-Repository - die Distributionen hinken bei
+# PHP-Versionen hinterher. Architektur und Release werden vom System gelesen,
+# damit dieselbe Zeile auf Raspberry Pi (arm64/armhf) und PC (amd64) passt.
+# Sury bedient nur Debian-Codenamen; auf Ubuntu liefe apt update in einen 404.
+PHP_INSTALL_VERSION="8.4"
+
+ensure_php() {
+    command -v php >/dev/null 2>&1 && return 0
+
+    local sudo="" arch codename id
+    if [[ "$(id -u)" != 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || { echo "webserver: PHP fehlt - Installation braucht root oder sudo" >&2; exit 1; }
+        sudo="sudo"
+    fi
+
+    id="$(. /etc/os-release 2>/dev/null && echo "${ID:-}")"
+    case "$id" in
+        debian|raspbian) ;;
+        *) echo "webserver: PHP fehlt - Sury-Installation nur fuer Debian/Raspberry Pi OS, hier '${id:-unbekannt}'" >&2; exit 1 ;;
+    esac
+
+    echo "webserver: PHP fehlt - installiere PHP ${PHP_INSTALL_VERSION} aus packages.sury.org"
+    export DEBIAN_FRONTEND=noninteractive
+    $sudo apt-get update
+    $sudo apt-get install -y apt-transport-https lsb-release ca-certificates curl gnupg2
+
+    arch="$(dpkg --print-architecture)"
+    codename="$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}")"
+    [[ -n "$codename" ]] || codename="$(lsb_release -sc)"
+
+    # --yes: ein Schluessel von einem abgebrochenen Lauf wird ueberschrieben statt nachzufragen.
+    curl -fsSL https://packages.sury.org/php/apt.gpg | $sudo gpg --dearmor --yes -o /usr/share/keyrings/deb.sury.org-php.gpg
+    echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg arch=${arch}] https://packages.sury.org/php/ ${codename} main" \
+        | $sudo tee /etc/apt/sources.list.d/php.list >/dev/null
+    $sudo apt-get update
+    $sudo apt-get install -y "php${PHP_INSTALL_VERSION}" "php${PHP_INSTALL_VERSION}-cli" "php${PHP_INSTALL_VERSION}-common" \
+        "php${PHP_INSTALL_VERSION}-fpm" "php${PHP_INSTALL_VERSION}-mbstring" "php${PHP_INSTALL_VERSION}-curl" \
+        "php${PHP_INSTALL_VERSION}-sqlite3"
+
+    command -v php >/dev/null 2>&1 || { echo "webserver: PHP-Installation fehlgeschlagen" >&2; exit 1; }
+}
+
+# Vor cfg(): ohne jq liest schon die Konfiguration mit PHP.
+case "${1:-start}" in
+    start|foreground|restart) ensure_php ;;
+esac
+
 # Liest einen jq-Pfad aus der config.json und loest {dir} auf; ohne jq springt PHP ein.
 cfg() {
     local filter="$1" default="${2-}" value

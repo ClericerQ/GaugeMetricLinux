@@ -31,6 +31,8 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   Listen, die nicht in ihre Karte passen, werden verdichtet (`.compact`, eine
   Zeile je Eintrag) und scrollen danach von selbst.
 - Webserver: `webserver.sh` (Port 8090 - 8080 belegt PackageLoggerPHP).
+  Fehlt `php`, installiert `start` PHP 8.4 aus packages.sury.org (Architektur
+  und Debian-Codename vom System, nur Debian/Raspberry Pi OS).
 - Kiosk: ebenfalls `webserver.sh` (Abschnitt `kiosk` in `config.json`). Beim
   Start sucht es eine grafische Sitzung am Geraet (Wayland-/X-Socket aus der
   Umgebung eines Sitzungsprozesses) und oeffnet Chromium im `--kiosk`-Modus als
