@@ -326,8 +326,14 @@ class cGaugePoller {
             $point += $this->historyPoint($key, $this->data[$key]);
         }
 
+        // Hintergrund-Messungen tragen im Verlauf den Zeitpunkt, an dem sie
+        // ankommen, nicht ihren Start: waehrend nvidia-smi oder curl laufen,
+        // schreiben die schnellen Takte weiter Snapshots, und das Dashboard holt
+        // per ?since=<generated> nur Punkte danach - ein Punkt mit Startzeit
+        // laege schon dahinter und kaeme nie an.
         if ($tier['history'] > 0 && $point !== []) {
-            $this->pushHistory($name, round($ts, 3), $point, $tier['history']);
+            $at = $tier['background'] ? microtime(true) : $ts;
+            $this->pushHistory($name, round($at, 3), $point, $tier['history']);
         }
     }
 
