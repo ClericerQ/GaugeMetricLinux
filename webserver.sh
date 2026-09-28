@@ -6,51 +6,169 @@ CONFIG="${DIR}config.json"
 
 [[ -r "$CONFIG" ]] || { echo "webserver: $CONFIG nicht lesbar" >&2; exit 1; }
 
-# Fehlt PHP, kommt es aus dem Sury-Repository - die Distributionen hinken bei
-# PHP-Versionen hinterher. Architektur und Release werden vom System gelesen,
-# damit dieselbe Zeile auf Raspberry Pi (arm64/armhf) und PC (amd64) passt.
-# Sury bedient nur Debian-Codenamen; auf Ubuntu liefe apt update in einen 404.
+# Fehlt PHP oder ist es aelter als 8.2, wird es per apt nachinstalliert.
+# Bietet schon ein eingetragenes Repository (Distribution, Sury, PPA) eine
+# passende Version, kommt sie von dort - Ubuntu 24.04 hat 8.3 selbst an Bord.
+# Erst wenn keines passt, wird das Fremd-Repository eingetragen: Sury fuer
+# Debian/Raspberry Pi OS, das PPA ondrej/php fuer Ubuntu und Ableger - Sury
+# bedient nur Debian-Codenamen, auf Ubuntu liefe apt update in einen 404.
+PHP_MIN_ID=80200
 PHP_INSTALL_VERSION="8.4"
+PHP_VERSIONS=(8.5 8.4 8.3 8.2)
 
-ensure_php() {
-    command -v php >/dev/null 2>&1 && return 0
+SUDO=""
+APT_UPDATED=""
 
-    local sudo="" arch codename id
-    if [[ "$(id -u)" != 0 ]]; then
-        command -v sudo >/dev/null 2>&1 || { echo "webserver: PHP fehlt - Installation braucht root oder sudo" >&2; exit 1; }
-        sudo="sudo"
+# Setzt SUDO; ohne root und ohne sudo ist keine Installation moeglich.
+need_root() {
+    if [[ "$(id -u)" == 0 ]]; then
+        SUDO=""
+        return 0
+    fi
+    command -v sudo >/dev/null 2>&1 || return 1
+    SUDO="sudo"
+}
+
+# Ein kaputtes Fremd-Repository laesst apt-get update scheitern, obwohl die
+# uebrigen Listen aktuell sind - deshalb nur Warnung. "force" nach dem
+# Eintragen eines Repositorys, sonst genuegt ein Lauf je Aufruf.
+apt_update() {
+    [[ -n "$APT_UPDATED" && "${1:-}" != force ]] && return 0
+    APT_UPDATED=1
+    $SUDO apt-get update || { echo "webserver: apt-get update meldet Fehler - weiter mit vorhandenen Paketlisten" >&2; return 1; }
+}
+
+php_ok() {
+    command -v php >/dev/null 2>&1 && php -r "exit(PHP_VERSION_ID >= ${PHP_MIN_ID} ? 0 : 1);" 2>/dev/null
+}
+
+# Erste installierbare Version: die gewuenschte zuerst, dann absteigend.
+php_candidate() {
+    local v cand
+    for v in "$PHP_INSTALL_VERSION" "${PHP_VERSIONS[@]}"; do
+        cand="$(apt-cache policy "php${v}-cli" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+        if [[ -n "$cand" && "$cand" != "(none)" ]]; then
+            echo "$v"
+            return 0
+        fi
+    done
+    return 1
+}
+
+php_repo_present() {
+    grep -rqsE 'packages\.sury\.org/php|ppa\.launchpad(content)?\.net/ondrej/php' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/
+}
+
+# Traegt das passende Fremd-Repository ein. Scheitert apt danach, fliegt der
+# Eintrag wieder raus - sonst bliebe jedes spaetere apt update kaputt.
+add_php_repo() {
+    local id like codename ucodename arch
+    { read -r id; read -r like; read -r codename; read -r ucodename; } < <(
+        . /etc/os-release 2>/dev/null
+        printf '%s\n' "${ID:-}" "${ID_LIKE:-}" "${VERSION_CODENAME:-}" "${UBUNTU_CODENAME:-}"
+    )
+
+    if [[ "$id" == ubuntu || -n "$ucodename" || " $like " == *" ubuntu "* ]]; then
+        echo "webserver: trage PPA ondrej/php ein (${id:-ubuntu} ${ucodename:-$codename})"
+        if ! command -v add-apt-repository >/dev/null 2>&1; then
+            apt_update || true
+            $SUDO apt-get install -y software-properties-common ca-certificates || return 1
+        fi
+        if ! $SUDO add-apt-repository -y ppa:ondrej/php; then
+            $SUDO add-apt-repository -y --remove ppa:ondrej/php >/dev/null 2>&1 || true
+            return 1
+        fi
+        apt_update force || true
+        return 0
     fi
 
-    id="$(. /etc/os-release 2>/dev/null && echo "${ID:-}")"
-    case "$id" in
-        debian|raspbian) ;;
-        *) echo "webserver: PHP fehlt - Sury-Installation nur fuer Debian/Raspberry Pi OS, hier '${id:-unbekannt}'" >&2; exit 1 ;;
-    esac
+    if [[ "$id" == debian || "$id" == raspbian || " $like " == *" debian "* ]]; then
+        [[ -n "$codename" ]] || { echo "webserver: kein VERSION_CODENAME in /etc/os-release - Sury nicht eintragbar" >&2; return 1; }
+        echo "webserver: trage packages.sury.org/php ein (${id} ${codename})"
+        apt_update || true
+        $SUDO apt-get install -y apt-transport-https ca-certificates curl gnupg || return 1
+        arch="$(dpkg --print-architecture)"
+        # --yes: ein Schluessel von einem abgebrochenen Lauf wird ueberschrieben statt nachzufragen.
+        curl -fsSL https://packages.sury.org/php/apt.gpg | $SUDO gpg --dearmor --yes -o /usr/share/keyrings/deb.sury.org-php.gpg || return 1
+        echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg arch=${arch}] https://packages.sury.org/php/ ${codename} main" \
+            | $SUDO tee /etc/apt/sources.list.d/php.list >/dev/null
+        if ! apt_update force; then
+            echo "webserver: Sury kennt '${codename}' offenbar nicht - Eintrag wieder entfernt" >&2
+            $SUDO rm -f /etc/apt/sources.list.d/php.list
+            apt_update force || true
+            return 1
+        fi
+        return 0
+    fi
 
-    echo "webserver: PHP fehlt - installiere PHP ${PHP_INSTALL_VERSION} aus packages.sury.org"
+    echo "webserver: kein PHP-Repository fuer '${id:-unbekannt}' bekannt - PHP >= 8.2 bitte von Hand installieren" >&2
+    return 1
+}
+
+ensure_php() {
+    php_ok && return 0
+
+    if command -v php >/dev/null 2>&1; then
+        echo "webserver: PHP $(php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?') ist zu alt - noetig ist 8.2 oder neuer"
+    else
+        echo "webserver: PHP fehlt"
+    fi
+    command -v apt-get >/dev/null 2>&1 || { echo "webserver: kein apt-get - PHP >= 8.2 bitte von Hand installieren" >&2; exit 1; }
+    need_root || { echo "webserver: PHP-Installation braucht root oder sudo" >&2; exit 1; }
     export DEBIAN_FRONTEND=noninteractive
-    $sudo apt-get update
-    $sudo apt-get install -y apt-transport-https lsb-release ca-certificates curl gnupg2
 
-    arch="$(dpkg --print-architecture)"
-    codename="$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}")"
-    [[ -n "$codename" ]] || codename="$(lsb_release -sc)"
+    local v
+    apt_update || true
+    if ! v="$(php_candidate)"; then
+        if php_repo_present; then
+            echo "webserver: PHP-Repository ist eingetragen, bietet aber kein PHP >= 8.2 fuer dieses System" >&2
+            exit 1
+        fi
+        add_php_repo || { echo "webserver: PHP-Repository konnte nicht eingetragen werden" >&2; exit 1; }
+        v="$(php_candidate)" || { echo "webserver: auch nach dem Eintragen kein PHP >= 8.2 installierbar" >&2; exit 1; }
+    fi
 
-    # --yes: ein Schluessel von einem abgebrochenen Lauf wird ueberschrieben statt nachzufragen.
-    curl -fsSL https://packages.sury.org/php/apt.gpg | $sudo gpg --dearmor --yes -o /usr/share/keyrings/deb.sury.org-php.gpg
-    echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg arch=${arch}] https://packages.sury.org/php/ ${codename} main" \
-        | $sudo tee /etc/apt/sources.list.d/php.list >/dev/null
-    $sudo apt-get update
-    $sudo apt-get install -y "php${PHP_INSTALL_VERSION}" "php${PHP_INSTALL_VERSION}-cli" "php${PHP_INSTALL_VERSION}-common" \
-        "php${PHP_INSTALL_VERSION}-fpm" "php${PHP_INSTALL_VERSION}-mbstring" "php${PHP_INSTALL_VERSION}-curl" \
-        "php${PHP_INSTALL_VERSION}-sqlite3"
+    # php${v}-fpm steht mit drin, damit das Metapaket php${v} nicht Apache nachzieht.
+    echo "webserver: installiere PHP ${v}"
+    $SUDO apt-get install -y "php${v}" "php${v}-cli" "php${v}-common" "php${v}-fpm" \
+        "php${v}-mbstring" "php${v}-curl" "php${v}-sqlite3"
 
-    command -v php >/dev/null 2>&1 || { echo "webserver: PHP-Installation fehlgeschlagen" >&2; exit 1; }
+    # Liegt noch ein altes PHP daneben, kann "php" weiter darauf zeigen.
+    if ! php_ok && [[ -x "/usr/bin/php${v}" ]]; then
+        $SUDO update-alternatives --set php "/usr/bin/php${v}" || true
+        hash -r
+    fi
+    php_ok || { echo "webserver: PHP-Installation fehlgeschlagen" >&2; exit 1; }
+}
+
+# smartctl liefert den Abschnitt smart (Lebensdauer der Laufwerke). Ohne es
+# fehlen nur diese Werte, deshalb Warnung statt Abbruch. /usr/sbin steht bei
+# normalen Benutzern oft nicht im PATH. --no-install-recommends: smartmontools
+# empfiehlt einen Mailer, apt zoege sonst postfix samt Rueckfragen mit.
+ensure_smartctl() {
+    command -v smartctl >/dev/null 2>&1 && return 0
+    [[ -x /usr/sbin/smartctl ]] && return 0
+
+    if ! command -v apt-get >/dev/null 2>&1 || ! need_root; then
+        echo "webserver: smartctl fehlt - smartmontools von Hand installieren, sonst keine SMART-Werte" >&2
+        return 1
+    fi
+    echo "webserver: smartctl fehlt - installiere smartmontools"
+    export DEBIAN_FRONTEND=noninteractive
+    apt_update || true
+    if ! $SUDO apt-get install -y --no-install-recommends smartmontools; then
+        echo "webserver: smartmontools-Installation fehlgeschlagen - keine SMART-Werte" >&2
+        return 1
+    fi
 }
 
 # Vor cfg(): ohne jq liest schon die Konfiguration mit PHP.
 case "${1:-start}" in
-    start|foreground|restart) ensure_php ;;
+    start|foreground|restart)
+        ensure_php
+        ensure_smartctl || true
+        ;;
 esac
 
 # Liest einen jq-Pfad aus der config.json und loest {dir} auf; ohne jq springt PHP ein.

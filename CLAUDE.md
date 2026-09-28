@@ -31,8 +31,12 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   Listen, die nicht in ihre Karte passen, werden verdichtet (`.compact`, eine
   Zeile je Eintrag) und scrollen danach von selbst.
 - Webserver: `webserver.sh` (Port 8090 - 8080 belegt PackageLoggerPHP).
-  Fehlt `php`, installiert `start` PHP 8.4 aus packages.sury.org (Architektur
-  und Debian-Codename vom System, nur Debian/Raspberry Pi OS).
+  Fehlt `php` oder ist es aelter als 8.2, installiert `start` es per apt:
+  bevorzugt 8.4, sonst die hoechste Version >= 8.2 aus den eingetragenen
+  Repositorys. Bietet keines eine, traegt es packages.sury.org (Debian/Raspberry
+  Pi OS) bzw. das PPA ondrej/php (Ubuntu und Ableger) ein. Ebenso installiert
+  `start` fehlendes smartctl (smartmontools, ohne Recommends) - scheitert das,
+  nur Warnung.
 - Kiosk: ebenfalls `webserver.sh` (Abschnitt `kiosk` in `config.json`). Beim
   Start sucht es eine grafische Sitzung am Geraet (Wayland-/X-Socket aus der
   Umgebung eines Sitzungsprozesses) und oeffnet Chromium im `--kiosk`-Modus als
