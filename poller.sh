@@ -34,7 +34,30 @@ LOCK_FILE="$(cfg '.gauge.lock_file' "${DIR}log/poller.lock")"
 LOG_FILE="$(cfg '.gauge.console_log' "${DIR}log/poller.out")"
 SNAPSHOT="$(cfg '.gauge.snapshot' "${DIR}db/metrics.json")"
 
+SVC_POLLER="$(cfg '.service.poller' 'gaugemetric-poller')"
+SVC_UNIT_DIR="$(cfg '.service.unit_dir' '/etc/systemd/system')"
+
 mkdir -p "$(dirname "$LOCK_FILE")" "$(dirname "$PID_FILE")" "$(dirname "$LOG_FILE")"
+
+# Eingerichtet wird der Dienst von "webserver.sh service-install". Nur eine
+# Unit, die auf diese Projektkopie zeigt, wird ferngesteuert.
+service_managed() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] \
+        && grep -qsF "\"${DIR}poller.sh\"" "${SVC_UNIT_DIR}/${SVC_POLLER}.service"
+}
+
+# Ein Handstart neben dem Dienst hielte die Sperre; der Dienst endete dann mit
+# "laeuft bereits" und der Poller hinge an einer Shell statt an systemd.
+service_ctl() {
+    local sudo=""
+    if [[ "$(id -u)" != 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || { echo "poller: Dienst ${SVC_POLLER} steuern braucht root oder sudo" >&2; exit 1; }
+        sudo="sudo"
+    fi
+    $sudo systemctl reset-failed "$SVC_POLLER" 2>/dev/null || true
+    $sudo systemctl "$1" "$SVC_POLLER"
+    echo "poller: $1 ueber systemd - ${SVC_POLLER} $(systemctl is-active "$SVC_POLLER" 2>/dev/null || true)"
+}
 
 # exec ersetzt die Subshell durch PHP: gleiche PID wie in der PID-Datei, und die
 # geerbte flock-Sperre auf FD 9 faellt erst mit dem PHP-Prozess.
@@ -45,6 +68,14 @@ serve() {
 
 start() {
     local mode="${1:-background}"
+
+    # Im Dienst (LOCK_WAIT=1) auf eine andere Instanz warten statt zu enden -
+    # sonst fiele die Unit still auf "inactive" oder liefe in Neustarts.
+    if ! flock -n 9 && [[ "$mode" == foreground && "${LOCK_WAIT:-0}" == 1 ]]; then
+        echo "poller: Sperre ${LOCK_FILE} von anderer Instanz belegt (PID $(cat "$PID_FILE" 2>/dev/null || echo '?')) - warte, bis sie endet"
+        flock 9
+        echo "poller: Sperre frei - starte"
+    fi
 
     flock -n 9 || {
         echo "poller: laeuft bereits (PID $(cat "$PID_FILE" 2>/dev/null || echo '?')) - kein zweiter Start"
@@ -128,12 +159,16 @@ wait_for_lock() {
 }
 
 case "${1:-start}" in
-    start)      start background 9>>"$LOCK_FILE" ;;
+    start)      if service_managed; then service_ctl start; else start background 9>>"$LOCK_FILE"; fi ;;
     foreground) start foreground 9>>"$LOCK_FILE" ;;
-    stop)       stop ;;
-    restart)    stop
-                wait_for_lock || echo "poller: Sperre noch belegt - Start wird trotzdem versucht" >&2
-                start background 9>>"$LOCK_FILE" ;;
+    stop)       if service_managed; then service_ctl stop; else stop; fi ;;
+    restart)    if service_managed; then
+                    service_ctl restart
+                else
+                    stop
+                    wait_for_lock || echo "poller: Sperre noch belegt - Start wird trotzdem versucht" >&2
+                    start background 9>>"$LOCK_FILE"
+                fi ;;
     status)     status ;;
     *)          echo "Aufruf: $0 [start|stop|restart|status|foreground]" >&2; exit 2 ;;
 esac
