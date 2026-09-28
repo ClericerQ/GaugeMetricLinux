@@ -43,6 +43,17 @@ Laufwerke). Gebaut auf BaseFrameworkVC - die Regeln unten gelten weiter.
   deren Benutzer. Ohne Sitzung (SSH, Container, Server) bleibt es beim Listener.
   `KIOSK=off|on` uebersteuert `kiosk.mode`; `kiosk` / `kiosk-stop` einzeln.
 
+- Dienst: `webserver.sh service-install` schreibt zwei systemd-Units fuer das
+  Verzeichnis, in dem das Skript liegt (`gaugemetric-web`, `gaugemetric-poller`,
+  Abschnitt `service` in `config.json`), und aktiviert sie (reboot-fest);
+  `service-remove` nimmt sie zurueck. Beide laufen `foreground` - mit `start`
+  endete das Skript nach dem Abspalten, systemd raeumte PHP ab und startete
+  im Sekundentakt neu. `Restart=on-failure` mit `RestartSec` und StartLimit;
+  `LOCK_WAIT=1` laesst die Unit auf die Sperre einer anderen Instanz warten.
+  Ist der Dienst eingerichtet, reichen `start`/`stop`/`restart` beider Skripte
+  an systemctl weiter. Der Kiosk sucht im Dienst bis `kiosk_wait_seconds` nach
+  einer grafischen Sitzung (beim Booten meldet die sich erst spaeter an).
+
 `poller.sh` liegt als Gegenstueck zu `webserver.sh` im Projekt-Root.
 `webserver.sh start` ruft `poller.sh start` mit auf (`web.start_poller`,
 `POLLER=off` uebersteuert); `webserver.sh stop` laesst den Poller laufen.

@@ -215,6 +215,20 @@ KIOSK_MARKER="--gaugemetric-kiosk=${DIR}"
 
 [[ "$KIOSK_WAIT" =~ ^[0-9]+$ ]] || KIOSK_WAIT=15
 
+# Beim Booten startet der Dienst vor der Anmeldung am Bildschirm. Mit
+# KIOSK_SESSION_WAIT > 0 (setzt die Unit) sucht der Kiosk so lange im
+# Hintergrund weiter; von Hand gestartet bleibt es bei einem Versuch.
+KIOSK_SESSION_WAIT="${KIOSK_SESSION_WAIT:-0}"
+[[ "$KIOSK_SESSION_WAIT" =~ ^[0-9]+$ ]] || KIOSK_SESSION_WAIT=0
+
+SVC_WEB="$(cfg '.service.web' 'gaugemetric-web')"
+SVC_POLLER="$(cfg '.service.poller' 'gaugemetric-poller')"
+SVC_UNIT_DIR="$(cfg '.service.unit_dir' '/etc/systemd/system')"
+SVC_RESTART_SEC="$(cfg '.service.restart_sec' '15')"
+SVC_LIMIT_BURST="$(cfg '.service.start_limit_burst' '5')"
+SVC_LIMIT_INTERVAL="$(cfg '.service.start_limit_interval_sec' '600')"
+SVC_KIOSK_WAIT="$(cfg '.service.kiosk_wait_seconds' '300')"
+
 # Ohne Poller zeigt das Dashboard nur einen alten Snapshot und graut aus.
 # POLLER=off ./webserver.sh startet nur den Webserver.
 POLLER_MODE="${POLLER:-$(cfg '.web.start_poller' 'true')}"
@@ -374,6 +388,28 @@ kiosk_rc() {
     if [[ "$KIOSK_MODE" == "on" ]]; then echo 1; else echo 0; fi
 }
 
+# Wartet losgeloest auf eine grafische Sitzung und startet dann den Kiosk.
+# Blockieren darf es nicht: im Dienst muss danach sofort PHP per exec folgen.
+kiosk_wait_session() {
+    mkdir -p "$(dirname "$KIOSK_LOG")"
+    echo "kiosk: noch keine grafische Sitzung - suche bis zu ${KIOSK_SESSION_WAIT}s weiter, Log ${KIOSK_LOG}"
+    (
+        exec 9>&-
+        trap '' HUP
+        local wait="$KIOSK_SESSION_WAIT" end=$((SECONDS + KIOSK_SESSION_WAIT))
+        KIOSK_SESSION_WAIT=0
+        while (( SECONDS < end )); do
+            sleep 3
+            if find_session; then
+                kiosk_start || true
+                exit 0
+            fi
+        done
+        echo "kiosk: nach ${wait}s keine grafische Sitzung - nur Listener"
+    ) >>"$KIOSK_LOG" 2>&1 </dev/null &
+    disown
+}
+
 kiosk_start() {
     local browser profile pids
     local -a flags
@@ -383,6 +419,10 @@ kiosk_start() {
     esac
 
     if ! find_session; then
+        if (( KIOSK_SESSION_WAIT > 0 )); then
+            kiosk_wait_session
+            return 0
+        fi
         if pgrep -x 'lightdm|gdm3|gdm|sddm|Xorg|Xwayland' >/dev/null 2>&1; then
             echo "kiosk: Anzeigedienst laeuft, aber keine angemeldete Sitzung - Autologin einrichten; nur Listener"
         else
@@ -494,6 +534,15 @@ kiosk_stop() {
 start() {
     local mode="${1:-background}"
 
+    # Im Dienst (LOCK_WAIT=1) wartet der Start auf die Sperre einer anderen
+    # Instanz und uebernimmt, sobald sie endet - ein Exit 0 liesse die Unit
+    # still auf "inactive" fallen, ein Fehler-Exit sie im Takt neu starten.
+    if ! flock -n 9 && [[ "$mode" == foreground && "${LOCK_WAIT:-0}" == 1 ]]; then
+        echo "webserver: Sperre ${LOCK_FILE} von anderer Instanz belegt (PID $(cat "$PID_FILE" 2>/dev/null || echo '?')) - warte, bis sie endet"
+        flock 9
+        echo "webserver: Sperre frei - starte"
+    fi
+
     # Ein zweiter Aufruf oeffnet das Kiosk-Fenster wieder, falls es zugemacht wurde.
     flock -n 9 || {
         echo "webserver: laeuft bereits (PID $(cat "$PID_FILE" 2>/dev/null || echo '?')) - kein zweiter Start"
@@ -563,6 +612,9 @@ stop() {
 
 status() {
     local pid
+    if service_managed; then
+        echo "dienst: ${SVC_WEB} $(systemctl is-active "$SVC_WEB" 2>/dev/null || true) ($(systemctl is-enabled "$SVC_WEB" 2>/dev/null || true)), ${SVC_POLLER} $(systemctl is-active "$SVC_POLLER" 2>/dev/null || true)"
+    fi
     pid="$(running_pid || true)"
     if [[ -n "$pid" ]]; then
         echo "webserver: laeuft (PID $pid) auf ${HOST}:${PORT}"
@@ -592,20 +644,158 @@ wait_for_lock() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# systemd-Dienst
+# ---------------------------------------------------------------------------
+
+# Zwei Units statt einer: stirbt der Webserver, misst der Poller weiter und
+# umgekehrt. Beide starten "foreground", damit PHP der Hauptprozess der Unit
+# bleibt. Mit "start" endete das Skript nach dem Abspalten, systemd hielte den
+# Dienst fuer beendet, raeumte PHP mit ab und startete alles neu - das
+# Dashboard stuende im Sekundentakt auf "offline".
+# Restart=on-failure: ein gewolltes Beenden (SIGTERM, Exit 0) bleibt beendet.
+# RestartSec und StartLimit verhindern, dass ein Fehler zur Schleife wird.
+unit_poller() {
+    cat <<EOF
+[Unit]
+Description=GaugeMetricLinux Poller (${DIR})
+After=local-fs.target
+StartLimitIntervalSec=${SVC_LIMIT_INTERVAL}
+StartLimitBurst=${SVC_LIMIT_BURST}
+
+[Service]
+Type=simple
+WorkingDirectory=${DIR}
+Environment=LOCK_WAIT=1
+ExecStart="${DIR}poller.sh" foreground
+Restart=on-failure
+RestartSec=${SVC_RESTART_SEC}
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# POLLER=off: den Poller fuehrt seine eigene Unit, ein zweiter aus dem
+# Webserver heraus laege in dessen cgroup und stuerbe mit jedem Neustart.
+unit_web() {
+    cat <<EOF
+[Unit]
+Description=GaugeMetricLinux Webserver und Kiosk (${DIR})
+Wants=network-online.target ${SVC_POLLER}.service
+After=network-online.target
+StartLimitIntervalSec=${SVC_LIMIT_INTERVAL}
+StartLimitBurst=${SVC_LIMIT_BURST}
+
+[Service]
+Type=simple
+WorkingDirectory=${DIR}
+Environment=POLLER=off
+Environment=LOCK_WAIT=1
+Environment=KIOSK_SESSION_WAIT=${SVC_KIOSK_WAIT}
+ExecStart="${DIR}webserver.sh" foreground
+Restart=on-failure
+RestartSec=${SVC_RESTART_SEC}
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+has_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+# Nur "unser" Dienst zaehlt: eine Unit gleichen Namens aus einer anderen
+# Projektkopie wird nicht ferngesteuert.
+service_managed() {
+    has_systemd && grep -qsF "\"${DIR}webserver.sh\"" "${SVC_UNIT_DIR}/${SVC_WEB}.service"
+}
+
+service_ctl() {
+    local action="$1" was_active=""
+    need_root || { echo "webserver: Dienst ${SVC_WEB} steuern braucht root oder sudo" >&2; exit 1; }
+    systemctl is-active --quiet "$SVC_WEB" && was_active=1
+    # Nach zu vielen Fehlstarts sperrt systemd die Unit, bis jemand sie freigibt.
+    $SUDO systemctl reset-failed "$SVC_WEB" "$SVC_POLLER" 2>/dev/null || true
+    case "$action" in
+        start)   $SUDO systemctl start "$SVC_POLLER" "$SVC_WEB" ;;
+        stop)    $SUDO systemctl stop "$SVC_WEB" ;;
+        restart) $SUDO systemctl restart "$SVC_WEB" ;;
+    esac
+    echo "webserver: ${action} ueber systemd - ${SVC_WEB} $(systemctl is-active "$SVC_WEB" 2>/dev/null || true), ${SVC_POLLER} $(systemctl is-active "$SVC_POLLER" 2>/dev/null || true)"
+    # Wie beim Handstart: ein zweites "start" oeffnet ein zugemachtes Kiosk-Fenster
+    # wieder. Nur wenn der Dienst schon lief - sonst startet er den Kiosk selbst.
+    if [[ "$action" == start && -n "$was_active" ]]; then
+        kiosk_start || true
+    fi
+}
+
+service_install() {
+    has_systemd || { echo "webserver: kein systemd aktiv - Dienst nicht einrichtbar" >&2; exit 1; }
+    if [[ "$(id -u)" != 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || { echo "webserver: Dienst einrichten braucht root oder sudo" >&2; exit 1; }
+        exec sudo "${DIR}webserver.sh" service-install
+    fi
+
+    # Laufende Handstarts beenden: deren Sperren liessen den Dienst sonst mit
+    # "laeuft bereits" (Exit 0) gleich wieder enden.
+    # Alte Units zuerst weg: sonst reichte poller.sh das stop nur an systemd
+    # weiter, und ein Poller von Hand liefe daneben weiter.
+    systemctl stop "$SVC_WEB" "$SVC_POLLER" 2>/dev/null || true
+    rm -f "${SVC_UNIT_DIR}/${SVC_WEB}.service" "${SVC_UNIT_DIR}/${SVC_POLLER}.service"
+    stop
+    "${DIR}poller.sh" stop 9>&- || true
+    wait_for_lock || echo "webserver: Sperre noch belegt - Dienst wird trotzdem eingerichtet" >&2
+
+    unit_poller > "${SVC_UNIT_DIR}/${SVC_POLLER}.service"
+    unit_web    > "${SVC_UNIT_DIR}/${SVC_WEB}.service"
+    systemctl daemon-reload
+    systemctl reset-failed "$SVC_WEB" "$SVC_POLLER" 2>/dev/null || true
+    systemctl enable --now "$SVC_POLLER" "$SVC_WEB"
+
+    echo "webserver: Dienst eingerichtet (${SVC_UNIT_DIR}/${SVC_WEB}.service, ${SVC_POLLER}.service)"
+    echo "           ${SVC_WEB} $(systemctl is-active "$SVC_WEB" || true), ${SVC_POLLER} $(systemctl is-active "$SVC_POLLER" || true), startet nach jedem Reboot"
+    echo "           Log: journalctl -u ${SVC_WEB} -u ${SVC_POLLER}"
+}
+
+service_remove() {
+    has_systemd || { echo "webserver: kein systemd aktiv" >&2; exit 1; }
+    if [[ "$(id -u)" != 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || { echo "webserver: Dienst entfernen braucht root oder sudo" >&2; exit 1; }
+        exec sudo "${DIR}webserver.sh" service-remove
+    fi
+    systemctl disable --now "$SVC_WEB" "$SVC_POLLER" 2>/dev/null || true
+    rm -f "${SVC_UNIT_DIR}/${SVC_WEB}.service" "${SVC_UNIT_DIR}/${SVC_POLLER}.service"
+    systemctl daemon-reload
+    systemctl reset-failed "$SVC_WEB" "$SVC_POLLER" 2>/dev/null || true
+    echo "webserver: Dienst entfernt - Start wieder von Hand mit $0 start"
+}
+
+# Ist der Dienst eingerichtet, gehen start/stop/restart an systemd: ein
+# Handstart daneben hielte die Sperre, und der Dienst liefe ins Leere.
 case "${1:-start}" in
-    start)      start background 9>>"$LOCK_FILE" ;;
+    start)      if service_managed; then service_ctl start; else start background 9>>"$LOCK_FILE"; fi ;;
     foreground) start foreground 9>>"$LOCK_FILE" ;;
     # stop schliesst den Kiosk mit; restart laesst ihn offen - die geladene Seite
-    # pollt weiter und faengt sich, sobald der Server wieder da ist.
-    stop)       kiosk_stop
-                stop ;;
-    restart)    stop
-                wait_for_lock || echo "webserver: Sperre noch belegt - Start wird trotzdem versucht" >&2
-                start background 9>>"$LOCK_FILE" ;;
+    # pollt weiter und faengt sich, sobald der Server wieder da ist. Unter systemd
+    # endet der Kiosk mit der Unit und kommt mit dem Neustart wieder.
+    stop)       if service_managed; then service_ctl stop; kiosk_stop; else kiosk_stop; stop; fi ;;
+    restart)    if service_managed; then
+                    service_ctl restart
+                else
+                    stop
+                    wait_for_lock || echo "webserver: Sperre noch belegt - Start wird trotzdem versucht" >&2
+                    start background 9>>"$LOCK_FILE"
+                fi ;;
     status)     status ;;
     kiosk)      running_pid >/dev/null || { echo "webserver: laeuft nicht - erst starten" >&2; exit 1; }
                 KIOSK_MODE=on
                 kiosk_start ;;
     kiosk-stop) kiosk_stop ;;
-    *)          echo "Aufruf: [KIOSK=auto|on|off] [POLLER=on|off] $0 [start|stop|restart|status|foreground|kiosk|kiosk-stop]" >&2; exit 2 ;;
+    service-install) service_install ;;
+    service-remove)  service_remove ;;
+    *)          echo "Aufruf: [KIOSK=auto|on|off] [POLLER=on|off] $0 [start|stop|restart|status|foreground|kiosk|kiosk-stop|service-install|service-remove]" >&2; exit 2 ;;
 esac
